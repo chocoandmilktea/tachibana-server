@@ -11,8 +11,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-  "xlsx": "^0.18.5"
-}
     "dotenv": "^16.4.5",
     "iconv-lite": "^0.6.3",
     "ws": "^8.18.0"
