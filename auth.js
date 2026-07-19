@@ -83,12 +83,20 @@ function checkAnswer(ans) {
   }
 }
 
+// TACHIBANA_PRIVATE_KEY は「PEMそのまま」でも「base64エンコード済みの1行」でも
+// どちらでも受け付ける（iPad等で複数行のクォート付き値を貼るのが難しいため）
+function resolvePrivateKeyPem() {
+  var raw = config.privateKeyPem.trim();
+  if (raw.indexOf("-----BEGIN") === 0) return raw;
+  return Buffer.from(raw, "base64").toString("utf8");
+}
+
 // base64 + RSA-OAEP(SHA256) で暗号化された仮想URLを秘密鍵で復号する
 function decryptUrl(encryptedB64) {
   var buf = Buffer.from(encryptedB64, "base64");
   var decrypted = crypto.privateDecrypt(
     {
-      key: config.privateKeyPem,
+      key: resolvePrivateKeyPem(),
       padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
       oaepHash: "sha256",
     },
