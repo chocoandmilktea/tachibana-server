@@ -41,12 +41,12 @@ class TachibanaEventClient extends EventEmitter {
 
     var params = new URLSearchParams({
       p_rid: "1",
-      p_board_no: "1000",
+      p_board_no: "1",
       p_gyou_no: "1",
       p_issue_code: ticker,
       p_mkt_code: this.mktCode,
       p_eno: "0",
-      p_evt_cmd: "ST",
+      p_evt_cmd: "ST,KP,FD",
     });
     var url = this.baseUrl + "?" + params.toString();
 
