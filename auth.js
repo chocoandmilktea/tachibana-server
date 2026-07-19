@@ -16,9 +16,15 @@ var state = {
   loadedDate: null,
 };
 
+// Railway等のサーバーはUTC(またはサーバー所在地のTZ)で動くことが多いため、
+// サーバーのタイムゾーン設定に依存せず、常にJST(UTC+9)を計算する
+function nowJst() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000);
+}
+
 function todayStr() {
-  var d = new Date();
-  return d.getFullYear() + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+  var d = nowJst();
+  return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, "0") + String(d.getUTCDate()).padStart(2, "0");
 }
 
 function loadSession() {
@@ -46,11 +52,11 @@ function saveSession() {
 
 function nextHeader() {
   state.pNo += 1;
-  var d = new Date();
+  var d = nowJst();
   var pad = function (n) { return String(n).padStart(2, "0"); };
   var pSdDate =
-    d.getFullYear() + "." + pad(d.getMonth() + 1) + "." + pad(d.getDate()) + "-" +
-    pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + ".000";
+    d.getUTCFullYear() + "." + pad(d.getUTCMonth() + 1) + "." + pad(d.getUTCDate()) + "-" +
+    pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + ":" + pad(d.getUTCSeconds()) + ".000";
   return { p_no: String(state.pNo), p_sd_date: pSdDate, sJsonOfmt: "5" };
 }
 
