@@ -40,8 +40,8 @@ class TachibanaEventClient extends EventEmitter {
     this._closedByUs = false;
 
     var params = new URLSearchParams({
-      p_rid: "1",
-      p_board_no: "1",
+      p_rid: "21",
+      p_board_no: "0",
       p_gyou_no: "1",
       p_issue_code: ticker,
       p_mkt_code: this.mktCode,
