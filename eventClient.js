@@ -46,7 +46,7 @@ class TachibanaEventClient extends EventEmitter {
       p_issue_code: ticker,
       p_mkt_code: this.mktCode,
       p_eno: "0",
-      p_evt_cmd: "ST,KP,FD",
+      p_evt_cmd: "ST",
     });
     var url = this.baseUrl + "?" + params.toString();
 
