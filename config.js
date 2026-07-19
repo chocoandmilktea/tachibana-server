@@ -16,8 +16,9 @@ module.exports = {
   authId: must("TACHIBANA_AUTH_ID"),
   privateKeyPem: must("TACHIBANA_PRIVATE_KEY"),
   mktCode: process.env.TACHIBANA_MKT_CODE || "00",
-  redisUrl: must("UPSTASH_REDIS_REST_URL"),
-  redisToken: must("UPSTASH_REDIS_REST_TOKEN"),
+  watchApi: must("TACHIBANA_WATCH_API"),
+  quoteApi: must("TACHIBANA_QUOTE_API"),
+  relaySecret: process.env.TACHIBANA_RELAY_SECRET || "", // Vercel側と同じ値を設定（推奨。空でも動く）
   watchStaleSeconds: parseInt(process.env.WATCH_STALE_SECONDS || "120", 10),
   quoteWriteMinIntervalSeconds: parseInt(process.env.QUOTE_WRITE_MIN_INTERVAL_SECONDS || "5", 10),
   watchPollIntervalSeconds: parseInt(process.env.WATCH_POLL_INTERVAL_SECONDS || "3", 10),

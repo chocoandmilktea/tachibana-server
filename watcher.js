@@ -6,7 +6,7 @@
 // 4. しばらく誰も見ていない場合は接続を切ってAPI負荷を抑える
 
 var auth = require("./auth");
-var redisMod = require("./redis");
+var relay = require("./relay");
 var config = require("./config");
 var TachibanaEventClient = require("./eventClient");
 
@@ -38,9 +38,9 @@ async function getOrCreateEventClient() {
 async function checkWatchAndSubscribe() {
   var watch = null;
   try {
-    watch = await redisMod.getWatch();
+    watch = await relay.getWatch();
   } catch (e) {
-    log("Redis読み込み失敗:", e.message);
+    log("Vercel API(watch)読み込み失敗:", e.message);
     return;
   }
 
@@ -75,14 +75,14 @@ async function checkWatchAndSubscribe() {
 async function flushToRedisIfDirty() {
   if (!dirty || !latestTicker || !latestFields) return;
   try {
-    await redisMod.setQuote(latestTicker, {
+    await relay.setQuote(latestTicker, {
       ticker: latestTicker,
       fields: latestFields,
       updatedAt: Date.now(),
     });
     dirty = false;
   } catch (e) {
-    log("Redis書き込み失敗:", e.message);
+    log("Vercel API(quote)書き込み失敗:", e.message);
   }
 }
 
