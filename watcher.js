@@ -4,6 +4,8 @@
 // 3. 受信したリアルタイムデータを、一定間隔に間引いてRedisへ書き込む
 //    （フロントはこのRedisの値をポーリングして表示する）
 // 4. しばらく誰も見ていない場合は接続を切ってAPI負荷を抑える
+// 5. 毎日03:30の閉局後は自動で再ログインし、接続を張り直す
+// 6. セッション切れ等のエラー応答を受け取ったら、その場で再ログインして張り直す
 
 var auth = require("./auth");
 var relay = require("./relay");
@@ -15,9 +17,36 @@ var latestFields = null;
 var latestTicker = null;
 var dirty = false;
 
+var lastForcedReLoginAt = 0;
+var FORCED_RELOGIN_MIN_INTERVAL_MS = 30 * 1000; // 短時間にエラーが連発しても再ログインを連打しない
+
 function log() {
   var args = Array.prototype.slice.call(arguments);
   console.log.apply(console, ["[watcher]"].concat(args));
+}
+
+// 今の接続を破棄する（次のループで新しいセッションを使って自動的に作り直される）
+function resetEventClient() {
+  if (eventClient) eventClient.stop();
+  eventClient = null;
+  latestFields = null;
+  latestTicker = null;
+}
+
+// セッション切れ等のエラー応答を受け取った時の復旧処理
+async function handleSessionError(evt) {
+  var now = Date.now();
+  if (now - lastForcedReLoginAt < FORCED_RELOGIN_MIN_INTERVAL_MS) return;
+  lastForcedReLoginAt = now;
+
+  log("セッションエラーを検知（p_errno=" + evt.fields.p_errno + " " + (evt.fields.p_err || "") + "）。再ログインします。");
+  try {
+    await auth.reLogin();
+    log("再ログインに成功しました。接続を張り直します。");
+  } catch (e) {
+    log("再ログインに失敗:", e.message);
+  }
+  resetEventClient();
 }
 
 async function getOrCreateEventClient() {
@@ -26,6 +55,9 @@ async function getOrCreateEventClient() {
     eventClient = new TachibanaEventClient(session.sUrlEventWebSocket, config.mktCode);
     eventClient.on("open", function (ticker) { log("接続開始:", ticker); });
     eventClient.on("error", function (err) { log("WebSocketエラー:", err.message); });
+    eventClient.on("sessionError", function (evt) {
+      handleSessionError(evt).catch(function (e) { log("復旧処理エラー:", e.message); });
+    });
     eventClient.on("data", function (evt) {
       latestTicker = evt.ticker;
       latestFields = evt.fields;
@@ -36,6 +68,16 @@ async function getOrCreateEventClient() {
 }
 
 async function checkWatchAndSubscribe() {
+  // 閉局(03:30)後の日次再ログインが必要なら実施し、接続を張り直す
+  var refreshed = await auth.refreshIfNeeded().catch(function (e) {
+    log("日次の再ログインに失敗:", e.message);
+    return false;
+  });
+  if (refreshed) {
+    log("日次の再ログインを実行しました。接続を張り直します。");
+    resetEventClient();
+  }
+
   var watch = null;
   try {
     watch = await relay.getWatch();

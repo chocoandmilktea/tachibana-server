@@ -27,6 +27,12 @@ function todayStr() {
   return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, "0") + String(d.getUTCDate()).padStart(2, "0");
 }
 
+// 立花証券APIサーバーの閉局時刻（毎日03:30）を過ぎているかどうか
+function isPastDailyClosing() {
+  var d = nowJst();
+  return d.getUTCHours() > 3 || (d.getUTCHours() === 3 && d.getUTCMinutes() >= 30);
+}
+
 function loadSession() {
   try {
     var raw = fs.readFileSync(SESSION_FILE, "utf8");
@@ -120,6 +126,7 @@ async function login() {
     sUrlEvent: decryptUrl(ans.sUrlEvent),
     sUrlEventWebSocket: decryptUrl(ans.sUrlEventWebSocket),
   };
+  state.loadedDate = todayStr(); // 今ログインした日付を記録（日次の再ログイン判定に使う）
   saveSession();
   console.log("[auth] ログイン成功。仮想URLを取得しました。");
 }
@@ -141,9 +148,19 @@ async function reLogin() {
   return state.urls;
 }
 
+// 閉局時刻(03:30)を過ぎていて、まだ本日分の再ログインをしていなければ再ログインする。
+// 再ログインした場合はtrueを返す（呼び出し側でWebSocket接続を張り直す必要がある）
+async function refreshIfNeeded() {
+  if (!isPastDailyClosing()) return false;
+  if (state.loadedDate === todayStr()) return false; // 今日すでにログイン済み
+  await reLogin();
+  return true;
+}
+
 module.exports = {
   ensureSession: ensureSession,
   reLogin: reLogin,
+  refreshIfNeeded: refreshIfNeeded,
   postToServer: postToServer,
   checkAnswer: checkAnswer,
   nextHeader: nextHeader,

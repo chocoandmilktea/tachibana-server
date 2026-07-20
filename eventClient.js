@@ -86,6 +86,13 @@ class TachibanaEventClient extends EventEmitter {
       var parts = rec.split("\x02");
       if (parts.length >= 2) fields[parts[0]] = parts[1];
     });
+
+    // p_errnoが"0"以外＝セッション切れ等のエラー応答。株価データとして扱わず別イベントで通知する
+    if (fields.p_errno && fields.p_errno !== "0") {
+      this.emit("sessionError", { ticker: ticker, fields: fields, raw: rawText });
+      return;
+    }
+
     this.emit("data", { ticker: ticker, fields: fields, raw: rawText });
   }
 }
