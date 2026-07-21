@@ -180,10 +180,12 @@ async function getRankingData() {
   var rows = codes.map(function (code) {
     var p = priceMap[code];
     if (!p) return null;
-    var price = parseFloat(p.pDPP) || 0;
+    var price = parseFloat(p.pDPP) || parseFloat(p.pPRP) || 0;
     var prevClose = parseFloat(p.pPRP) || 0;
     var volume = parseFloat(p.pDV) || 0;
-    if (!price || !volume) return null; // 未上場・売買停止中等はランキング対象外
+    // 値段が全く取れない銘柄（上場前・廃止等）のみ除外。
+    // 出来高0（寄付き前などまだ売買が無い状態）は除外しない
+    if (!price) return null;
     return {
       code: code,
       name: nameMap[code] || code,
