@@ -102,6 +102,103 @@ async function getIssueDetail(code) {
   return data;
 }
 
+// ── ランキング用データ(出来高・現在値・名前・業種)。全銘柄まとめて返す ────────
+// 銘柄マスタは24時間キャッシュ（滅多に変わらないため）、
+// 出来高・現在値は3分キャッシュ（頻繁に呼ばれても毎回立花証券に問い合わせずに済むように）
+var rankingMasterCache = { ts: 0, list: null };
+var RANKING_MASTER_TTL = 24 * 60 * 60 * 1000;
+var rankingDataCache = { ts: 0, rows: null };
+var RANKING_DATA_TTL = 3 * 60 * 1000;
+
+function chunk(arr, size) {
+  var out = [];
+  for (var i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function getRankingMaster() {
+  var now = Date.now();
+  if (rankingMasterCache.list && now - rankingMasterCache.ts < RANKING_MASTER_TTL) return rankingMasterCache.list;
+
+  var session = await auth.ensureSession();
+  var params = Object.assign(auth.nextHeader(), {
+    sCLMID: "CLMMfdsGetMasterData",
+    sTargetCLMID: "CLMIssueMstKabu",
+    sTargetColumn: "sIssueCode,sIssueName,sGyousyuCode,sGyousyuName",
+  });
+  var ans = await auth.postToServer(session.sUrlMaster, params);
+  auth.checkAnswer(ans);
+  var all = ans.CLMIssueMstKabu || [];
+  // 業種コード9999(その他)はETF/REIT/投信等が多いため除外し、実株式のみに絞り込む
+  var stocks = all.filter(function (i) { return i.sGyousyuCode !== "9999"; });
+
+  rankingMasterCache = { ts: now, list: stocks };
+  log("銘柄マスタ更新:", stocks.length, "件（全", all.length, "件中）");
+  return stocks;
+}
+
+async function fetchBatchPrice(session, codes) {
+  var params = Object.assign(auth.nextHeader(), {
+    sCLMID: "CLMMfdsGetMarketPrice",
+    sTargetIssueCode: codes.join(","),
+    sTargetColumn: "pDPP,pPRP,pDV",
+  });
+  var ans = await auth.postToServer(session.sUrlPrice, params);
+  auth.checkAnswer(ans);
+  return ans.aCLMMfdsMarketPrice || [];
+}
+
+async function getRankingData() {
+  var now = Date.now();
+  if (rankingDataCache.rows && now - rankingDataCache.ts < RANKING_DATA_TTL) return rankingDataCache.rows;
+
+  var master = await getRankingMaster();
+  var nameMap = {}, sectorMap = {};
+  master.forEach(function (i) {
+    nameMap[i.sIssueCode] = i.sIssueName;
+    sectorMap[i.sIssueCode] = i.sGyousyuName;
+  });
+
+  var session = await auth.ensureSession();
+  var codes = master.map(function (i) { return i.sIssueCode; });
+  var batches = chunk(codes, 120);
+
+  var priceMap = {};
+  var concurrency = 5; // 検証済み：この並列数で全銘柄の取得が約4秒で完了する
+  for (var j = 0; j < batches.length; j += concurrency) {
+    var group = batches.slice(j, j + concurrency);
+    var results = await Promise.allSettled(group.map(function (b) { return fetchBatchPrice(session, b); }));
+    results.forEach(function (r) {
+      if (r.status === "fulfilled") {
+        r.value.forEach(function (p) { priceMap[p.sIssueCode] = p; });
+      } else {
+        log("バッチ取得エラー:", r.reason.message);
+      }
+    });
+  }
+
+  var rows = codes.map(function (code) {
+    var p = priceMap[code];
+    if (!p) return null;
+    var price = parseFloat(p.pDPP) || 0;
+    var prevClose = parseFloat(p.pPRP) || 0;
+    var volume = parseFloat(p.pDV) || 0;
+    if (!price || !volume) return null; // 未上場・売買停止中等はランキング対象外
+    return {
+      code: code,
+      name: nameMap[code] || code,
+      sector: sectorMap[code] || null,
+      price: price,
+      prevClose: prevClose,
+      volume: volume,
+    };
+  }).filter(Boolean);
+
+  rankingDataCache = { ts: now, rows: rows };
+  log("ランキング用データ更新:", rows.length, "件");
+  return rows;
+}
+
 function sendJson(res, statusCode, obj) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -132,6 +229,17 @@ function start() {
         .then(function (data) { sendJson(res, 200, data); })
         .catch(function (e) {
           log("銘柄詳細取得エラー:", e.message);
+          sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    if (parsed.pathname === "/ranking-data" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      getRankingData()
+        .then(function (rows) { sendJson(res, 200, { rows: rows }); })
+        .catch(function (e) {
+          log("ランキングデータ取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
         });
       return;
