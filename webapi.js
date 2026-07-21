@@ -67,6 +67,41 @@ async function getTopixChange() {
   return change;
 }
 
+// ── 銘柄詳細情報(PER/PBR/EPS/BPS/配当利回り・配当権利落日)。銘柄ごとに1時間キャッシュ ──
+var issueDetailCache = {}; // code -> { data, ts }
+var ISSUE_DETAIL_TTL = 60 * 60 * 1000;
+
+async function getIssueDetail(code) {
+  var now = Date.now();
+  var cached = issueDetailCache[code];
+  if (cached && now - cached.ts < ISSUE_DETAIL_TTL) return cached.data;
+
+  var session = await auth.ensureSession();
+  var params = Object.assign(auth.nextHeader(), {
+    sCLMID: "CLMMfdsGetIssueDetail",
+    sTargetIssueCode: code,
+  });
+  var ans = await auth.postToServer(session.sUrlMaster, params);
+  auth.checkAnswer(ans);
+  var list = ans.aCLMMfdsIssueDetail || [];
+  var item = list[0];
+  if (!item) throw new Error("銘柄詳細が見つかりません: " + code);
+
+  var data = {
+    per: item.pRPER ? parseFloat(item.pRPER) : null,
+    pbr: item.pSPBR ? parseFloat(item.pSPBR) : null,
+    eps: item.pEPSF ? parseFloat(item.pEPSF) : null,
+    bps: item.pBPSB ? parseFloat(item.pBPSB) : null,
+    dividendYield: item.pSYIE ? parseFloat(item.pSYIE) : null,
+    // pCLOEは「YYYY/MM/DD」形式で返るため、アプリ側で使いやすいよう「YYYY-MM-DD」に変換
+    exRightsDate: item.pCLOE ? item.pCLOE.replace(/\//g, "-") : null,
+  };
+
+  issueDetailCache[code] = { data: data, ts: now };
+  log("銘柄詳細取得成功:", code, JSON.stringify(data));
+  return data;
+}
+
 function sendJson(res, statusCode, obj) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -84,6 +119,19 @@ function start() {
         .then(function (change) { sendJson(res, 200, { change: change }); })
         .catch(function (e) {
           log("TOPIX取得エラー:", e.message);
+          sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    if (parsed.pathname === "/issue-detail" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      var code = parsed.query.code;
+      if (!code) return sendJson(res, 400, { error: "code required" });
+      getIssueDetail(code)
+        .then(function (data) { sendJson(res, 200, data); })
+        .catch(function (e) {
+          log("銘柄詳細取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
         });
       return;
