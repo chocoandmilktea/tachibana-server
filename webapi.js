@@ -201,6 +201,34 @@ async function getRankingData() {
   return rows;
 }
 
+// ── 銘柄名マスタ(コード→会社名)。ipo.js(/api/ipo)の代替用。24時間キャッシュ ──
+var nameMasterCache = { ts: 0, names: null };
+var NAME_MASTER_TTL = 24 * 60 * 60 * 1000;
+
+async function getNameMaster() {
+  var now = Date.now();
+  if (nameMasterCache.names && now - nameMasterCache.ts < NAME_MASTER_TTL) return nameMasterCache.names;
+
+  var session = await auth.ensureSession();
+  var params = Object.assign(auth.nextHeader(), {
+    sCLMID: "CLMMfdsGetMasterData",
+    sTargetCLMID: "CLMIssueMstKabu",
+    sTargetColumn: "sIssueCode,sIssueName",
+  });
+  var ans = await auth.postToServer(session.sUrlMaster, params);
+  auth.checkAnswer(ans);
+  var list = ans.CLMIssueMstKabu || [];
+
+  var names = {};
+  list.forEach(function (i) {
+    if (i.sIssueCode && i.sIssueName) names[i.sIssueCode] = i.sIssueName;
+  });
+
+  nameMasterCache = { ts: now, names: names };
+  log("銘柄名マスタ更新:", Object.keys(names).length, "件");
+  return names;
+}
+
 function sendJson(res, statusCode, obj) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -242,6 +270,17 @@ function start() {
         .then(function (rows) { sendJson(res, 200, { rows: rows }); })
         .catch(function (e) {
           log("ランキングデータ取得エラー:", e.message);
+          sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    if (parsed.pathname === "/names" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      getNameMaster()
+        .then(function (names) { sendJson(res, 200, { names: names }); })
+        .catch(function (e) {
+          log("銘柄名マスタ取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
         });
       return;
