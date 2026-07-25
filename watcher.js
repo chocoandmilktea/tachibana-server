@@ -20,6 +20,12 @@ var dirty = false;
 var lastForcedReLoginAt = 0;
 var FORCED_RELOGIN_MIN_INTERVAL_MS = 30 * 1000; // 短時間にエラーが連発しても再ログインを連打しない
 
+// ── 歩み値調査用の一時ログ（確認が終わったら削除してOK） ──────────────────
+// 銘柄を切り替えた直後から5件だけ、届いたfieldsをそのままログに出す。
+// 常時ログすると流量が多く見づらい＆Railwayのログ枠を圧迫するため件数を絞っている。
+var debugLogCount = 0;
+var DEBUG_LOG_MAX = 5;
+
 function log() {
   var args = Array.prototype.slice.call(arguments);
   console.log.apply(console, ["[watcher]"].concat(args));
@@ -62,6 +68,12 @@ async function getOrCreateEventClient() {
       latestTicker = evt.ticker;
       latestFields = evt.fields;
       dirty = true;
+
+      // ── 歩み値調査用の一時ログ ──
+      if (debugLogCount < DEBUG_LOG_MAX) {
+        debugLogCount++;
+        log("[歩み値調査 " + debugLogCount + "/" + DEBUG_LOG_MAX + "] fields=", JSON.stringify(evt.fields));
+      }
     });
   }
   return eventClient;
@@ -110,6 +122,7 @@ async function checkWatchAndSubscribe() {
 
   if (client.currentTicker !== desiredTicker) {
     log("監視銘柄を切り替え:", client.currentTicker, "→", desiredTicker);
+    debugLogCount = 0; // 銘柄を切り替えるたびに、新しい銘柄で改めて5件ログする
     client.subscribe(desiredTicker);
   }
 }
