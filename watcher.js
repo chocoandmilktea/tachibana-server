@@ -65,8 +65,11 @@ async function getOrCreateEventClient() {
       handleSessionError(evt).catch(function (e) { log("復旧処理エラー:", e.message); });
     });
     eventClient.on("data", function (evt) {
+      // EVENT I/Fは差分（変化した項目だけ）を送ってくるため、丸ごと置き換えると
+      // 前回までに受け取った板情報（気配値）などが消えてしまう。
+      // 既存のlatestFieldsに新しい値を上書きする形でマージして保持する。
       latestTicker = evt.ticker;
-      latestFields = evt.fields;
+      latestFields = Object.assign({}, latestFields, evt.fields);
       dirty = true;
 
       // ── 歩み値調査用の一時ログ ──
@@ -123,6 +126,11 @@ async function checkWatchAndSubscribe() {
   if (client.currentTicker !== desiredTicker) {
     log("監視銘柄を切り替え:", client.currentTicker, "→", desiredTicker);
     debugLogCount = 0; // 銘柄を切り替えるたびに、新しい銘柄で改めて5件ログする
+    // 前の銘柄のfieldsを持ち越さないよう、切り替え時に必ずリセットする
+    // （マージ処理を入れたことで、ここをリセットし忘れると前の銘柄のデータが
+    //   新しい銘柄のデータに混ざり込んでしまうため）
+    latestFields = null;
+    latestTicker = null;
     client.subscribe(desiredTicker);
   }
 }
