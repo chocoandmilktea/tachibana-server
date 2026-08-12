@@ -18,6 +18,7 @@
 
 var cron = require("node-cron");
 var config = require("./config");
+var holidays = require("./holidays");
 
 function log() {
   var args = Array.prototype.slice.call(arguments);
@@ -132,34 +133,6 @@ function describe(r) {
   return "status=" + r.status + (err ? " " + err : "");
 }
 
-// 保存済みのスキャン結果から、その時間帯の行を読む（休場日判定に使う）
-async function fetchSlotRows(date, slot) {
-  var res = await fetch(
-    API_BASE + "/api/sync?resource=scan-result&date=" + encodeURIComponent(date),
-    { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
-  );
-  var json = await res.json();
-  var rows = json && json.slots && json.slots[slot];
-  return Array.isArray(rows) ? rows : [];
-}
-
-// 休場日（祝日）判定：最初のバッチの結果が全件 stale:true なら、その日は
-// market が開いていないとみなす。以降のバッチを回しても前日終値しか取れず、
-// 統計を汚したうえに無駄な外部API呼び出しになるため中断する。
-//
-// ただし寄り前(0830)だけは判定しない。8:45時点ではまだ当日の足が1本も無く、
-// 平日でも必ず全件 stale:true になるため、ここで判定すると毎営業日の
-// 寄り前スキャンが中断されてしまう。
-async function looksMarketClosed(date, slot) {
-  if (slot === "0830") return false;
-  var rows = await fetchSlotRows(date, slot);
-  if (!rows.length) return false;
-  for (var i = 0; i < rows.length; i++) {
-    if (!rows[i].stale) return false;
-  }
-  return true;
-}
-
 // ── 1スロット分の実行 ───────────────────────────────────────────────────
 // 前のスロットがまだ走っている間は新しいスロットを開始しない（排他制御）。
 // scan-run は Redis の read-modify-write なので、重なると結果が壊れる。
@@ -167,6 +140,15 @@ var running = false;
 var runningSlot = null;
 
 async function runScanSlot(slot) {
+  var date = jstDateString();
+
+  // 休場日（土日・祝日・年末年始）はバッチを1回も投げずに終わる。
+  // 前日終値しか取れず統計を汚すうえ、外部APIの無駄打ちになるため。
+  if (holidays.isMarketClosed(date)) {
+    log(slot, "休場日のためスキップします:", date);
+    return;
+  }
+
   if (running) {
     log(slot, "前のスロット(" + runningSlot + ")が実行中のため、今回は開始しません");
     return;
@@ -175,7 +157,6 @@ async function runScanSlot(slot) {
   runningSlot = slot;
 
   var startedAt = Date.now();
-  var date = jstDateString();
   log(slot + " start " + date);
 
   var offset = 0;
@@ -243,24 +224,9 @@ async function runScanSlot(slot) {
       }
 
       var body = r.body || {};
-      var isFirstSuccess = (totalStocks == null);
       doneCount += Number(body.done) || 0;
       failedStocks += Array.isArray(body.failed) ? body.failed.length : 0;
       if (body.total != null) totalStocks = Number(body.total);
-
-      // 休場日なら最初のバッチの時点で分かるので、ここで打ち切る
-      if (isFirstSuccess && (Number(body.done) || 0) > 0) {
-        var closed = false;
-        try {
-          closed = await looksMarketClosed(date, slot);
-        } catch (e3) {
-          log(slot, "休場判定に失敗（続行します）:", e3.message);
-        }
-        if (closed) {
-          abortReason = "最初のバッチが全件stale。休場日とみなして中断";
-          break;
-        }
-      }
 
       if (body.nextOffset == null) break; // 全件終了
       offset = Number(body.nextOffset);
