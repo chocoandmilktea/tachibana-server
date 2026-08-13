@@ -13,7 +13,7 @@ var SESSION_FILE = path.join(__dirname, "session.json"); // 当日分のセッ�
 var state = {
   pNo: 0,
   urls: null, // {sUrlRequest, sUrlMaster, sUrlPrice, sUrlEvent, sUrlEventWebSocket}
-  loadedDate: null,
+  loadedAt: 0, // 今のセッションを取得した時刻(epoch ms)。日次の再ログイン判定に使う
 };
 
 // Railway等のサーバーはUTC(またはサーバー所在地のTZ)で動くことが多いため、
@@ -27,10 +27,20 @@ function todayStr() {
   return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, "0") + String(d.getUTCDate()).padStart(2, "0");
 }
 
-// 立花証券APIサーバーの閉局時刻（毎日03:30）を過ぎているかどうか
-function isPastDailyClosing() {
+// 日次の再ログインを行う時刻（JST）。
+// 立花証券APIは毎日3:00〜8:30がシステムメンテナンスで、メンテ中に取得した
+// セッションはメンテ明けに無効化されてしまう（以後 p_errno=2 が返り続ける）。
+// そのためメンテ明けの8:35に再ログインする。
+// ※8:45のpremarket収集・8:50の自動スキャンより前に完了する必要がある
+var RELOGIN_HOUR_JST = 8;
+var RELOGIN_MINUTE_JST = 35;
+
+// 本日の再ログイン時刻(8:35 JST)を epoch ms で返す
+function todayReLoginTimeMs() {
   var d = nowJst();
-  return d.getUTCHours() > 3 || (d.getUTCHours() === 3 && d.getUTCMinutes() >= 30);
+  var jstMidnightUtc = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  // JSTの壁時計を実時刻(UTC基準のepoch)に戻すため9時間引く
+  return jstMidnightUtc + (RELOGIN_HOUR_JST * 60 + RELOGIN_MINUTE_JST) * 60 * 1000 - 9 * 60 * 60 * 1000;
 }
 
 function loadSession() {
@@ -40,7 +50,7 @@ function loadSession() {
     if (saved.date === todayStr() && saved.urls && saved.urls.sUrlRequest) {
       state.pNo = saved.pNo || 0;
       state.urls = saved.urls;
-      state.loadedDate = saved.date;
+      state.loadedAt = saved.loadedAt || 0;
       return true;
     }
   } catch (e) {
@@ -52,7 +62,7 @@ function loadSession() {
 function saveSession() {
   fs.writeFileSync(
     SESSION_FILE,
-    JSON.stringify({ date: todayStr(), pNo: state.pNo, urls: state.urls }, null, 2)
+    JSON.stringify({ date: todayStr(), pNo: state.pNo, urls: state.urls, loadedAt: state.loadedAt }, null, 2)
   );
 }
 
@@ -114,9 +124,8 @@ function extractServerPno(ans) {
   return max || null;
 }
 
-// 立花証券APIへのリクエスト共通入口。p_no は内部で採番するので呼び出し側は業務パラメータのみ渡す。
 // p_errno=6（通番エラー）が返った場合は採番し直して最大PNO_RETRY_MAX回リトライする。
-async function request(url, paramsObj) {
+async function requestWithPnoRetry(url, paramsObj) {
   var ans = null;
   for (var attempt = 0; attempt <= PNO_RETRY_MAX; attempt++) {
     // 2回目以降は間隔を広げて送る（後続の採番を止めている間に確実に到着させるため）
@@ -128,6 +137,58 @@ async function request(url, paramsObj) {
   }
   // リトライしても通番エラーのまま。呼び出し側のcheckAnswerでエラーとして扱われる
   return ans;
+}
+
+// ── セッション切断(p_errno=2)からの自動復旧 ─────────────────────────────
+// メンテナンス(3:00〜8:30)明けなどでセッションが無効になると、以後の全リクエストが
+// p_errno=2 で失敗し続け、サーバーを再起動するまで復旧しない。
+// そのため p_errno=2 を検知したらその場で再ログインし、同じリクエストを1回だけ再送する。
+var reLoginPromise = null; // 進行中の再ログインを共有し、同時に何本もログインを叩かないようにする
+
+function reLoginShared() {
+  if (!reLoginPromise) {
+    reLoginPromise = reLogin().finally(function () { reLoginPromise = null; });
+  }
+  return reLoginPromise;
+}
+
+// 再ログインすると仮想URLは新しいものに変わるため、
+// 旧セッションのどのURLだったか（sUrlMaster等）を覚えておいて読み替える
+function urlKeyOf(target) {
+  if (!state.urls) return null;
+  var keys = Object.keys(state.urls);
+  for (var i = 0; i < keys.length; i++) {
+    if (state.urls[keys[i]] === target) return keys[i];
+  }
+  return null;
+}
+
+// 立花証券APIへのリクエスト共通入口。p_no は内部で採番するので呼び出し側は業務パラメータのみ渡す。
+// 通番エラー(p_errno=6)のリトライに加え、セッション切断(p_errno=2)なら再ログインして1回だけ再送する。
+async function request(url, paramsObj) {
+  var sentAt = Date.now();
+  var ans = await requestWithPnoRetry(url, paramsObj);
+  // ログイン要求自体はここで再ログインさせない（無限ループになるため）
+  if (String(ans && ans.p_errno) !== "2" || paramsObj.sCLMID === "CLMAuthLoginRequest") return ans;
+
+  console.log("[auth] セッション切断を検知。再ログインします。");
+  var key = urlKeyOf(url); // 再ログイン前に控えておく（reLoginでstate.urlsがクリアされるため）
+  try {
+    // 送信後に別のリクエストが再ログイン済みなら、そのセッションで再送するだけでよい
+    var urls = state.loadedAt > sentAt ? state.urls : await reLoginShared();
+    // リトライは1回だけ。ここでは request ではなく requestWithPnoRetry を呼ぶので再帰しない
+    var retry = await requestWithPnoRetry((key && urls && urls[key]) || url, paramsObj);
+    if (String(retry && retry.p_errno) !== "0") {
+      var err = new Error("p_errno=" + (retry && retry.p_errno) + " p_err=" + (retry && retry.p_err));
+      err.answer = retry;
+      throw err;
+    }
+    console.log("[auth] 再ログイン後のリトライ成功");
+    return retry;
+  } catch (e) {
+    console.log("[auth] 再ログイン後のリトライも失敗: " + e.message);
+    throw e;
+  }
 }
 
 // 立花証券サーバーへPOST（応答はShiftJISで返ってくる）
@@ -189,7 +250,7 @@ async function login() {
     sUrlEvent: decryptUrl(ans.sUrlEvent),
     sUrlEventWebSocket: decryptUrl(ans.sUrlEventWebSocket),
   };
-  state.loadedDate = todayStr(); // 今ログインした日付を記録（日次の再ログイン判定に使う）
+  state.loadedAt = Date.now(); // 今ログインした時刻を記録（日次の再ログイン判定に使う）
   saveSession();
   console.log("[auth] ログイン成功。仮想URLを取得しました。");
 }
@@ -211,11 +272,15 @@ async function reLogin() {
   return state.urls;
 }
 
-// 閉局時刻(03:30)を過ぎていて、まだ本日分の再ログインをしていなければ再ログインする。
+// 本日の再ログイン時刻(8:35 JST)を過ぎていて、まだその時刻以降のセッションを
+// 取得していなければ再ログインする。
+// 「日付」ではなく「時刻」で判定するのは、メンテ中(3:00〜8:30)に起動して取得した
+// セッションも 8:35 に取り直す必要があるため。
 // 再ログインした場合はtrueを返す（呼び出し側でWebSocket接続を張り直す必要がある）
 async function refreshIfNeeded() {
-  if (!isPastDailyClosing()) return false;
-  if (state.loadedDate === todayStr()) return false; // 今日すでにログイン済み
+  var reLoginTime = todayReLoginTimeMs();
+  if (Date.now() < reLoginTime) return false; // まだ本日の再ログイン時刻より前
+  if (state.loadedAt >= reLoginTime) return false; // 本日の再ログイン時刻以降に取得済み
   await reLogin();
   return true;
 }
