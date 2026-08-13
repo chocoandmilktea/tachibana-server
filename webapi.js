@@ -137,11 +137,12 @@ async function getRankingMaster() {
   return stocks;
 }
 
-async function fetchBatchPrice(session, codes) {
+// columns省略時は従来どおり「現在値・前日終値・出来高」の3項目だけを取る
+async function fetchBatchPrice(session, codes, columns) {
   var params = Object.assign(auth.nextHeader(), {
     sCLMID: "CLMMfdsGetMarketPrice",
     sTargetIssueCode: codes.join(","),
-    sTargetColumn: "pDPP,pPRP,pDV",
+    sTargetColumn: columns || "pDPP,pPRP,pDV",
   });
   var ans = await auth.postToServer(session.sUrlPrice, params);
   auth.checkAnswer(ans);
@@ -229,6 +230,24 @@ async function getNameMaster() {
   return names;
 }
 
+// ── 時価情報の生データ（/market-price）。キャッシュは一切かけない ──────────
+// 寄り前の板・気配が取れるかを実測するための調査用。どのカラムが実際に有効か
+// 未確認なので、cols クエリで個別に試せるようにしてある（省略時は DEFAULT_COLS）。
+var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV";
+
+// 立花からの戻り値（aCLMMfdsMarketPrice を含む応答そのもの）を加工せずに返す。
+// checkAnswer() を通さないのは、エラー時の p_errno / sResultText 等も
+// そのまま見たいため（握りつぶすと原因のカラムが特定できない）。
+async function getMarketPrice(codes, cols) {
+  var session = await auth.ensureSession();
+  var params = Object.assign(auth.nextHeader(), {
+    sCLMID: "CLMMfdsGetMarketPrice",
+    sTargetIssueCode: codes,
+    sTargetColumn: cols || DEFAULT_COLS,
+  });
+  return await auth.postToServer(session.sUrlPrice, params);
+}
+
 function sendJson(res, statusCode, obj) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -259,6 +278,19 @@ function start() {
         .then(function (data) { sendJson(res, 200, data); })
         .catch(function (e) {
           log("銘柄詳細取得エラー:", e.message);
+          sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    if (parsed.pathname === "/market-price" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      var mpCode = parsed.query.code; // カンマ区切りで複数可
+      if (!mpCode) return sendJson(res, 400, { error: "code required" });
+      getMarketPrice(mpCode, parsed.query.cols)
+        .then(function (ans) { sendJson(res, 200, ans); })
+        .catch(function (e) {
+          log("時価情報取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
         });
       return;
