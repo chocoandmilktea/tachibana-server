@@ -1,5 +1,5 @@
 // tachibana-server/premarketLogger.js
-// 寄り前（8:31〜9:06）の気配推移を自動で貯めるロガー。
+// 寄り前（8:45〜9:06）の気配推移を自動で貯めるロガー。
 //
 // これまでは /market-price を手で叩いて観測していたが、それだと毎朝端末を
 // 開いておく必要がある。常駐しているこのサーバー自身が15秒おきに取得し、
@@ -10,7 +10,7 @@
 // ・立花の戻り値は一切加工しない（後から何が取れていたのかを検証するため）
 // ・エラーも握りつぶさず同じ配列に積む（ログイン未確立・カラム不正の切り分け用）
 // ・時刻判定は必ずJST。Railwayのサーバー時刻はUTCなので、サーバーのTZに依存させない
-// ・15秒×35分＝1日あたり約140レコード。1銘柄なら十分軽いので間引きも圧縮もしない
+// ・15秒×21分＝1日あたり約84レコード。1銘柄なら十分軽いので間引きも圧縮もしない
 
 var auth = require("./auth");
 var config = require("./config");
@@ -35,7 +35,7 @@ var CODES = envStr("PREMARKET_CODES", "7203")
 
 var API_BASE = envStr("VERCEL_API_BASE", "https://daytrade-simulator.vercel.app").replace(/\/+$/, "");
 
-var START_MINUTE = 8 * 60 + 31; // 8:31:00 から
+var START_MINUTE = 8 * 60 + 45; // 8:45:00 から
 var END_MINUTE = 9 * 60 + 6;    // 9:06:00 まで
 var FETCH_INTERVAL_MS = 15 * 1000;   // 取得間隔
 var TICK_INTERVAL_MS = 60 * 1000;    // 時間外は1分ごとに時刻だけ見る
@@ -177,7 +177,7 @@ function tick() {
 function start() {
   setInterval(tick, TICK_INTERVAL_MS);
   tick(); // 窓の途中で再起動した場合もその場から収集を始める
-  log("起動しました。8:31〜9:06(JST/平日) に15秒間隔で取得します。宛先:", API_BASE);
+  log("起動しました。8:45〜9:06(JST/平日) に15秒間隔で取得します。宛先:", API_BASE);
 }
 
 // runSession は動作確認用に公開している（通常は tick からのみ呼ばれる）
