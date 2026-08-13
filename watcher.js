@@ -4,7 +4,7 @@
 // 3. 受信したリアルタイムデータを、一定間隔に間引いてRedisへ書き込む
 //    （フロントはこのRedisの値をポーリングして表示する）
 // 4. しばらく誰も見ていない場合は接続を切ってAPI負荷を抑える
-// 5. 毎日03:30の閉局後は自動で再ログインし、接続を張り直す
+// 5. 毎日8:35（メンテナンス明け）に自動で再ログインし、接続を張り直す
 // 6. セッション切れ等のエラー応答を受け取ったら、その場で再ログインして張り直す
 
 var auth = require("./auth");
@@ -83,7 +83,7 @@ async function getOrCreateEventClient() {
 }
 
 async function checkWatchAndSubscribe() {
-  // 閉局(03:30)後の日次再ログインが必要なら実施し、接続を張り直す
+  // メンテナンス明け(8:35)の日次再ログインが必要なら実施し、接続を張り直す
   var refreshed = await auth.refreshIfNeeded().catch(function (e) {
     log("日次の再ログインに失敗:", e.message);
     return false;
