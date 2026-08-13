@@ -137,14 +137,26 @@ async function getRankingMaster() {
   return stocks;
 }
 
-async function fetchBatchPrice(session, codes) {
+// /market-price（寄り前の板・気配の実測用）のデフォルトカラム。
+// ※これらが全て有効かは未確認。無効なカラムが混ざると立花がエラーを返すため、
+// 　cols クエリで個別に試せるようにしてある。
+var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV";
+
+// columns 省略時は従来どおり "pDPP,pPRP,pDV"（ランキング用）
+async function fetchBatchPrice(session, codes, columns) {
   var params = Object.assign(auth.nextHeader(), {
     sCLMID: "CLMMfdsGetMarketPrice",
     sTargetIssueCode: codes.join(","),
-    sTargetColumn: "pDPP,pPRP,pDV",
+    sTargetColumn: columns || "pDPP,pPRP,pDV",
   });
   var ans = await auth.postToServer(session.sUrlPrice, params);
-  auth.checkAnswer(ans);
+  try {
+    auth.checkAnswer(ans);
+  } catch (e) {
+    // 立花の生レスポンスを添付しておき、呼び出し元でそのまま返せるようにする
+    e.answer = ans;
+    throw e;
+  }
   return ans.aCLMMfdsMarketPrice || [];
 }
 
@@ -260,6 +272,26 @@ function start() {
         .catch(function (e) {
           log("銘柄詳細取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    // 寄り前に板・気配が取れるかの実測用。キャッシュは一切かけず（秒単位の変化を見たいため）、
+    // 立花の戻り値 aCLMMfdsMarketPrice を加工せずそのまま返す
+    if (parsed.pathname === "/market-price" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      var mpCode = parsed.query.code;
+      if (!mpCode) return sendJson(res, 400, { error: "code required" });
+      var mpCols = parsed.query.cols || DEFAULT_COLS;
+      auth.ensureSession()
+        .then(function (session) {
+          return fetchBatchPrice(session, String(mpCode).split(","), mpCols);
+        })
+        .then(function (rows) { sendJson(res, 200, { cols: mpCols, rows: rows }); })
+        .catch(function (e) {
+          log("market-price取得エラー:", e.message);
+          // 立花のエラー内容も握りつぶさずそのまま返す（有効カラムの切り分けに使う）
+          sendJson(res, 500, { error: e.message, raw: e.answer || null });
         });
       return;
     }
