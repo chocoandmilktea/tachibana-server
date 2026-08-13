@@ -326,4 +326,6 @@ function start() {
   });
 }
 
-module.exports = { start: start };
+// fetchBatchPrice / DEFAULT_COLS は premarketLogger.js から直接使う
+// （常駐サーバー内から自分自身をHTTPで叩かずに済ませるため）
+module.exports = { start: start, fetchBatchPrice: fetchBatchPrice, DEFAULT_COLS: DEFAULT_COLS };
