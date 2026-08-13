@@ -66,6 +66,70 @@ function nextHeader() {
   return { p_no: String(state.pNo), p_sd_date: pSdDate, sJsonOfmt: "5" };
 }
 
+// ── p_no（通番）の直列化 ────────────────────────────────────────────────
+// 立花証券APIは「リクエストの p_no がサーバー到着順に増えていること」を要求する。
+// 採番後に Promise.all 等で並列送信すると採番順と到着順が入れ替わり、
+// 後から採番したリクエストが先に着くと p_errno=6 で弾かれる。
+// そのため「採番 → 送信開始」までを1本のPromiseチェーンで直列化する。
+// 応答待ちは直列化しない（遅くなるため並列のまま）。
+var sendChain = Promise.resolve();
+// 送信の間隔。ネットワークの揺らぎ（送信〜到着のばらつき）より大きくないと追い越しが起きる
+var SEND_GAP_MS = parseInt(process.env.TACHIBANA_SEND_GAP_MS || "15", 10);
+// リトライ時の間隔。後続の採番を長めに止めて「追い越されない」状態を作ってから再送する
+var RETRY_GAP_MS = parseInt(process.env.TACHIBANA_RETRY_GAP_MS || "150", 10);
+var PNO_RETRY_MAX = 2; // p_errno=6 が返ったときに採番し直して再送する最大回数
+
+function sleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// 採番と送信開始だけを直列化してPOSTする（1回のみ。リトライはrequest側で行う）
+function postSerialized(url, paramsObj, gapMs) {
+  // gate は「採番 → 送信開始 → 次の採番までの間隔」まで待つPromise
+  var gate = sendChain.then(function () {
+    var params = Object.assign(nextHeader(), paramsObj);
+    var resPromise = postToServer(url, params); // ここで送信が始まる
+    resPromise.catch(function () {}); // 応答は下段で待つので、未処理拒否の警告だけ防ぐ
+    return sleep(gapMs).then(function () {
+      // 応答Promiseはオブジェクトに包む（thenで自動的に待たれてしまうのを防ぐため）
+      return { res: resPromise };
+    });
+  });
+  // 次のリクエストは「送信開始まで」を待てばよい。応答は待たせない
+  sendChain = gate.then(function () {}, function () {});
+  return gate.then(function (holder) { return holder.res; });
+}
+
+// エラー応答から立花サーバー側が最後に受け付けた p_no を読み取る
+// 例: 引数（p_no:[1449] <= 前要求.p_no:[1450]）エラー。
+function extractServerPno(ans) {
+  var text = String((ans && ans.p_err) || "");
+  var re = /p_no:\[(\d+)\]/g;
+  var max = 0;
+  var m;
+  while ((m = re.exec(text)) !== null) {
+    var n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max || null;
+}
+
+// 立花証券APIへのリクエスト共通入口。p_no は内部で採番するので呼び出し側は業務パラメータのみ渡す。
+// p_errno=6（通番エラー）が返った場合は採番し直して最大PNO_RETRY_MAX回リトライする。
+async function request(url, paramsObj) {
+  var ans = null;
+  for (var attempt = 0; attempt <= PNO_RETRY_MAX; attempt++) {
+    // 2回目以降は間隔を広げて送る（後続の採番を止めている間に確実に到着させるため）
+    ans = await postSerialized(url, paramsObj, attempt === 0 ? SEND_GAP_MS : RETRY_GAP_MS);
+    if (String(ans && ans.p_errno) !== "6") return ans;
+    // サーバーが受け付け済みの通番より確実に大きい値から採番し直す
+    var serverPno = extractServerPno(ans);
+    if (serverPno && serverPno > state.pNo) state.pNo = serverPno;
+  }
+  // リトライしても通番エラーのまま。呼び出し側のcheckAnswerでエラーとして扱われる
+  return ans;
+}
+
 // 立花証券サーバーへPOST（応答はShiftJISで返ってくる）
 async function postToServer(url, paramsObj) {
   var res = await fetch(url, {
@@ -112,11 +176,10 @@ function decryptUrl(encryptedB64) {
 }
 
 async function login() {
-  var params = Object.assign(nextHeader(), {
+  var ans = await request(config.urlAuth, {
     sCLMID: "CLMAuthLoginRequest",
     sAuthId: config.authId,
   });
-  var ans = await postToServer(config.urlAuth, params);
   checkAnswer(ans);
 
   state.urls = {
@@ -161,6 +224,7 @@ module.exports = {
   ensureSession: ensureSession,
   reLogin: reLogin,
   refreshIfNeeded: refreshIfNeeded,
+  request: request, // 立花証券APIを叩くときはこれを使う（p_noの採番と直列化・リトライ込み）
   postToServer: postToServer,
   checkAnswer: checkAnswer,
   nextHeader: nextHeader,
