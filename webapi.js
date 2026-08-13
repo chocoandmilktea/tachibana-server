@@ -33,11 +33,10 @@ async function getTopixChange() {
   var session = await auth.ensureSession();
 
   // 指数マスタからTOPIXの銘柄コードを検索（verify-topix.jsで確認済みの方式）
-  var masterParams = Object.assign(auth.nextHeader(), {
+  var masterAns = await auth.request(session.sUrlMaster, {
     sCLMID: "CLMMfdsGetMasterData",
     sTargetCLMID: "CLMIssueMstIndex",
   });
-  var masterAns = await auth.postToServer(session.sUrlMaster, masterParams);
   auth.checkAnswer(masterAns);
   var list = masterAns.CLMIssueMstIndex || [];
   var topixItem = list.filter(function (item) {
@@ -45,12 +44,11 @@ async function getTopixChange() {
   })[0];
   if (!topixItem) throw new Error("TOPIX銘柄が指数マスタに見つかりません");
 
-  var histParams = Object.assign(auth.nextHeader(), {
+  var histAns = await auth.request(session.sUrlPrice, {
     sCLMID: "CLMMfdsGetMarketPriceHistory",
     sIssueCode: topixItem.sIssueCode,
     sSizyouC: "00",
   });
-  var histAns = await auth.postToServer(session.sUrlPrice, histParams);
   auth.checkAnswer(histAns);
   var hist = histAns.aCLMMfdsMarketPriceHistory || [];
   if (hist.length < 2) throw new Error("TOPIX日足データが不足しています");
@@ -77,11 +75,10 @@ async function getIssueDetail(code) {
   if (cached && now - cached.ts < ISSUE_DETAIL_TTL) return cached.data;
 
   var session = await auth.ensureSession();
-  var params = Object.assign(auth.nextHeader(), {
+  var ans = await auth.request(session.sUrlMaster, {
     sCLMID: "CLMMfdsGetIssueDetail",
     sTargetIssueCode: code,
   });
-  var ans = await auth.postToServer(session.sUrlMaster, params);
   auth.checkAnswer(ans);
   var list = ans.aCLMMfdsIssueDetail || [];
   var item = list[0];
@@ -121,12 +118,11 @@ async function getRankingMaster() {
   if (rankingMasterCache.list && now - rankingMasterCache.ts < RANKING_MASTER_TTL) return rankingMasterCache.list;
 
   var session = await auth.ensureSession();
-  var params = Object.assign(auth.nextHeader(), {
+  var ans = await auth.request(session.sUrlMaster, {
     sCLMID: "CLMMfdsGetMasterData",
     sTargetCLMID: "CLMIssueMstKabu",
     sTargetColumn: "sIssueCode,sIssueName,sGyousyuCode,sGyousyuName",
   });
-  var ans = await auth.postToServer(session.sUrlMaster, params);
   auth.checkAnswer(ans);
   var all = ans.CLMIssueMstKabu || [];
   // 業種コード9999(その他)はETF/REIT/投信等が多いため除外し、実株式のみに絞り込む
@@ -144,12 +140,11 @@ var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV";
 
 // columns 省略時は従来どおり "pDPP,pPRP,pDV"（ランキング用）
 async function fetchBatchPrice(session, codes, columns) {
-  var params = Object.assign(auth.nextHeader(), {
+  var ans = await auth.request(session.sUrlPrice, {
     sCLMID: "CLMMfdsGetMarketPrice",
     sTargetIssueCode: codes.join(","),
     sTargetColumn: columns || "pDPP,pPRP,pDV",
   });
-  var ans = await auth.postToServer(session.sUrlPrice, params);
   try {
     auth.checkAnswer(ans);
   } catch (e) {
@@ -222,12 +217,11 @@ async function getNameMaster() {
   if (nameMasterCache.names && now - nameMasterCache.ts < NAME_MASTER_TTL) return nameMasterCache.names;
 
   var session = await auth.ensureSession();
-  var params = Object.assign(auth.nextHeader(), {
+  var ans = await auth.request(session.sUrlMaster, {
     sCLMID: "CLMMfdsGetMasterData",
     sTargetCLMID: "CLMIssueMstKabu",
     sTargetColumn: "sIssueCode,sIssueName",
   });
-  var ans = await auth.postToServer(session.sUrlMaster, params);
   auth.checkAnswer(ans);
   var list = ans.CLMIssueMstKabu || [];
 
