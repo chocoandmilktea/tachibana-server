@@ -35,7 +35,7 @@ function envStr(name, def) {
 var TZ = "Asia/Tokyo";
 
 var ENABLED = envStr("SCAN_ENABLED", "true").toLowerCase() !== "false";
-var TIMES = envStr("SCAN_TIMES", "8:45,9:30,11:00,13:00,15:00");
+var TIMES = envStr("SCAN_TIMES", "8:50,9:30,11:00,13:00,15:00");
 var API_BASE = envStr("VERCEL_API_BASE", "https://daytrade-simulator.vercel.app").replace(/\/+$/, "");
 
 // 5件を超えるとVercel側が10秒でタイムアウトして必ず失敗するため、上限で丸める
@@ -54,11 +54,14 @@ var MAX_BATCHES = 400;                   // 暴走防止（5件×400＝2000銘�
 
 // api/_scan.js の SLOT_SESSIONS と同じ5つ。ここに無いslotを渡すとVercel側が
 // 400（unknown slot）を返して何も処理しないため、必ずこの中のどれかに丸めて渡す。
-var SLOTS = ["0830", "0930", "1100", "1300", "1500"];
+// 先頭は寄り前スキャンの実施時刻（8:50）に合わせた "0850"。以前は "0830" で登録して
+// いたため、Vercel側(api/_scan.js)は過去データを読めるよう "0830" も受け付けたままにしてある。
+var SLOTS = ["0850", "0930", "1100", "1300", "1500"];
 
 // ── 時刻まわり ─────────────────────────────────────────────────────────
 // 実行時刻を、その時刻が属する時間帯（直前のslot）に丸める。
-// 例: 8:45→"0830" / 9:30→"0930" / 11:00→"1100"
+// 例: 8:50→"0850" / 9:30→"0930" / 11:00→"1100"
+// 先頭slotより前の時刻（例: 8:45）は、丸め先が無いため先頭slot("0850")として扱う。
 function slotForTime(hour, minute) {
   var mins = hour * 60 + minute;
   var found = SLOTS[0];
