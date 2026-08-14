@@ -160,13 +160,19 @@ async function runSession() {
 }
 
 // ── 起動 ───────────────────────────────────────────────────────────────
+// 収集の窓（平日の 8:45〜9:06 JST）に入っているか。
+// 即時判定と毎分判定の両方から使うため関数に切り出している。
+function isInWindow(d) {
+  if (isWeekend(d)) return false;
+  var m = jstMinuteOfDay(d);
+  return m >= START_MINUTE && m < END_MINUTE;
+}
+
 // 時間外は1分ごとに時刻を見るだけ。窓に入ったら収集ループへ入る。
+// running フラグで多重起動を防ぐ（起動直後の即時開始と毎分判定が重ならないように）。
 function tick() {
   if (running) return;
-  var d = nowJst();
-  if (isWeekend(d)) return;
-  var m = jstMinuteOfDay(d);
-  if (m < START_MINUTE || m >= END_MINUTE) return;
+  if (!isInWindow(nowJst())) return;
 
   running = true;
   runSession()
@@ -175,9 +181,19 @@ function tick() {
 }
 
 function start() {
-  setInterval(tick, TICK_INTERVAL_MS);
-  tick(); // 窓の途中で再起動した場合もその場から収集を始める
   log("起動しました。8:45〜9:06(JST/平日) に15秒間隔で取得します。宛先:", API_BASE);
+
+  // 毎分の判定。窓外からの通常の開始はこちらが担当する。
+  setInterval(tick, TICK_INTERVAL_MS);
+
+  // 起動が窓の途中だった場合、次の分境界まで待つと最大60秒ぶん取り逃す。
+  // 分境界を待たず、その場で1回だけ判定して即座に収集を始める。
+  if (isInWindow(nowJst())) {
+    log("起動時に窓内のため即時開始します");
+    tick();
+  } else {
+    log("起動時は窓外です。8:45を待機します");
+  }
 }
 
 // runSession は動作確認用に公開している（通常は tick からのみ呼ばれる）
