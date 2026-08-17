@@ -51,6 +51,7 @@ var BATCH_INTERVAL_MS = 1000;            // バッチ間の待機
 var RETRY_WAIT_MS = 3000;                // 失敗時に再試行するまでの待機
 var REQUEST_TIMEOUT_MS = 20 * 1000;      // 1回のHTTP呼び出しの上限（Vercel側は10秒で切れる）
 var MAX_BATCHES = 400;                   // 暴走防止（5件×400＝2000銘柄ぶん）
+var MAX_SAME_OFFSET = 3;                 // 同一offsetがこの回数連続したら停滞と判断して中断
 
 // api/_scan.js の SLOT_SESSIONS と同じ5つ。ここに無いslotを渡すとVercel側が
 // 400（unknown slot）を返して何も処理しないため、必ずこの中のどれかに丸めて渡す。
@@ -169,6 +170,8 @@ async function runScanSlot(slot) {
   var skippedBatches = 0;   // 再試行しても駄目で飛ばしたバッチ数
   var batchCount = 0;
   var abortReason = null;
+  var prevOffset = -1;      // 直前に設定したoffset（-1＝まだ無い）
+  var sameOffsetCount = 0;  // 同じoffsetが連続した回数
 
   try {
     while (true) {
@@ -233,6 +236,18 @@ async function runScanSlot(slot) {
 
       if (body.nextOffset == null) break; // 全件終了
       offset = Number(body.nextOffset);
+
+      // nextOffset が進まない（例: 0 を返し続ける）と上限まで空回りするため、
+      // 同じoffsetが続いたら停滞とみなして打ち切る
+      if (offset === prevOffset) sameOffsetCount++;
+      else sameOffsetCount = 1;
+      prevOffset = offset;
+      if (sameOffsetCount >= MAX_SAME_OFFSET) {
+        abortReason = "offset=" + offset + " が" + MAX_SAME_OFFSET +
+          "回連続で進まなかったため中断（Vercel側が nextOffset を進めていない可能性）";
+        break;
+      }
+
       await sleep(BATCH_INTERVAL_MS);
     }
   } catch (e) {
