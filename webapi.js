@@ -136,7 +136,7 @@ async function getRankingMaster() {
 // /market-price（寄り前の板・気配の実測用）のデフォルトカラム。
 // ※これらが全て有効かは未確認。無効なカラムが混ざると立花がエラーを返すため、
 // 　cols クエリで個別に試せるようにしてある。
-var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV";
+var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV,pGAP1,pGBP1,pGAV1,pGBV1,pQOV,pQUV";
 
 // columns 省略時は従来どおり "pDPP,pPRP,pDV"（ランキング用）
 async function fetchBatchPrice(session, codes, columns) {
