@@ -156,14 +156,30 @@ function authHeaders() {
   return h;
 }
 
+// Vercelの上限は4.5MB。PREMARKET_MAX をどこまで上げられるかを実測で判断するため、
+// 送信直前に「銘柄数 / 実バイト数 / レコード数」を出しておく。
+// 文字数ではなくバイト数で測る（銘柄名などマルチバイト文字が入るため）。
+function logPayloadSize(payload, body) {
+  var bytes = Buffer.byteLength(body, "utf8");
+  log("POST " + (payload.codes || []).length + "銘柄 / " +
+    Math.round(bytes / 1024) + "KB / " + (payload.records || []).length + "レコード");
+  if (bytes > 1024 * 1024) {
+    warn("POSTサイズが1MBを超えました（Vercel上限4.5MB）");
+  }
+}
+
 async function postLog(payload) {
   var lastError = null;
+  // 本文は1回だけ作り、リトライでも同じものを使い回す（サイズ計測とも一致させる）
+  var body = JSON.stringify(payload);
+  logPayloadSize(payload, body);
+
   for (var attempt = 1; attempt <= POST_MAX_ATTEMPTS; attempt++) {
     try {
       var res = await fetch(API_BASE + "/api/sync?resource=premarket-log", {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify(payload),
+        body: body,
         signal: AbortSignal.timeout(POST_TIMEOUT_MS),
       });
       if (res.status === 200) {
