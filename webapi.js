@@ -2,13 +2,12 @@
 // Vercel（stock.js等）からのオンデマンド問い合わせに応える簡易HTTPサーバー。
 // 既にログイン済みのセッション（auth.js）を使い回すことで、Vercel側で
 // 毎回ログインし直す必要をなくす。新しい依存パッケージは追加せず、
-// Node標準のhttp/urlモジュールのみ使用。
+// Node標準のhttpモジュールとグローバルのURLのみ使用。
 //
 // 現時点では /topix（TOPIX前日比%）のみ対応。今後、PER/PBR等を
 // 追加する場合もこのファイルにエンドポイントを増やしていく想定。
 
 var http = require("http");
-var url = require("url");
 var auth = require("./auth");
 var config = require("./config");
 
@@ -22,14 +21,15 @@ function checkSecret(req) {
   return req.headers["x-relay-secret"] === config.relaySecret;
 }
 
-// ── TOPIX前日比%（1時間キャッシュ） ──────────────────────────────────────
+// ── TOPIX前日比%（1時間キャッシュ＋取得中Promiseの共有） ──────────────────
 var topixCache = { change: null, ts: 0 };
 var TOPIX_TTL = 60 * 60 * 1000;
+// 取得中のPromiseを保持し、同時に来たリクエストは全て同じPromiseを待つ。
+// キャッシュが空の状態で短時間に何本も来ると、立花証券APIへ同じ問い合わせが
+// 重複して飛んでしまうため（実測: 13秒間に15回）、それを1回にまとめる。
+var topixInflight = null;
 
-async function getTopixChange() {
-  var now = Date.now();
-  if (topixCache.change !== null && now - topixCache.ts < TOPIX_TTL) return topixCache.change;
-
+async function fetchTopixChange() {
   var session = await auth.ensureSession();
 
   // 指数マスタからTOPIXの銘柄コードを検索（verify-topix.jsで確認済みの方式）
@@ -60,9 +60,23 @@ async function getTopixChange() {
   if (!prevClose) throw new Error("TOPIX前日終値が不正です");
   var change = (lastClose - prevClose) / prevClose * 100;
 
-  topixCache = { change: change, ts: now };
+  topixCache = { change: change, ts: Date.now() };
   log("TOPIX取得成功。前日比:", change.toFixed(2) + "%");
   return change;
+}
+
+async function getTopixChange() {
+  var now = Date.now();
+  if (topixCache.change !== null && now - topixCache.ts < TOPIX_TTL) return topixCache.change;
+  // 既に取得中なら、その結果に相乗りする
+  if (topixInflight) return topixInflight;
+
+  // 成功・失敗どちらでも必ずnullに戻す（失敗時に永久に同じ失敗Promiseを返さないため）。
+  // エラーは従来どおりそのまま呼び出し元へ伝播する。
+  topixInflight = fetchTopixChange().finally(function () {
+    topixInflight = null;
+  });
+  return topixInflight;
 }
 
 // ── 銘柄詳細情報(PER/PBR/EPS/BPS/配当利回り・配当権利落日)。銘柄ごとに1時間キャッシュ ──
@@ -244,7 +258,9 @@ function start() {
   var port = process.env.PORT || 8080;
 
   var server = http.createServer(function (req, res) {
-    var parsed = url.parse(req.url, true);
+    // url.parse() は非推奨のためグローバルのURLを使う。
+    // req.url はパス以降のみなので、ベースにダミーのオリジンを与えて解釈させる。
+    var parsed = new URL(req.url, "http://localhost");
 
     if (parsed.pathname === "/topix" && req.method === "GET") {
       if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
@@ -259,7 +275,7 @@ function start() {
 
     if (parsed.pathname === "/issue-detail" && req.method === "GET") {
       if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
-      var code = parsed.query.code;
+      var code = parsed.searchParams.get("code");
       if (!code) return sendJson(res, 400, { error: "code required" });
       getIssueDetail(code)
         .then(function (data) { sendJson(res, 200, data); })
@@ -274,9 +290,9 @@ function start() {
     // 立花の戻り値 aCLMMfdsMarketPrice を加工せずそのまま返す
     if (parsed.pathname === "/market-price" && req.method === "GET") {
       if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
-      var mpCode = parsed.query.code;
+      var mpCode = parsed.searchParams.get("code");
       if (!mpCode) return sendJson(res, 400, { error: "code required" });
-      var mpCols = parsed.query.cols || DEFAULT_COLS;
+      var mpCols = parsed.searchParams.get("cols") || DEFAULT_COLS;
       auth.ensureSession()
         .then(function (session) {
           return fetchBatchPrice(session, String(mpCode).split(","), mpCols);
