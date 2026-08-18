@@ -10,7 +10,9 @@
 // ・立花の戻り値は一切加工しない（後から何が取れていたのかを検証するため）
 // ・エラーも握りつぶさず同じ配列に積む（ログイン未確立・カラム不正の切り分け用）
 // ・時刻判定は必ずJST。Railwayのサーバー時刻はUTCなので、サーバーのTZに依存させない
-// ・15秒×21分＝1日あたり約84レコード。1銘柄なら十分軽いので間引きも圧縮もしない
+// ・15秒×21分＝1日あたり約84レコード。1ティック1リクエストなので間引きも圧縮もしない
+// ・対象銘柄は環境変数 PREMARKET_CODES で差し替える。ただし1ティックを15秒に
+// 　収めるため PREMARKET_MAX（既定8）で件数に上限を掛ける
 
 var auth = require("./auth");
 var config = require("./config");
@@ -21,17 +23,81 @@ function log() {
   console.log.apply(console, ["[premarket]"].concat(args));
 }
 
+function warn() {
+  var args = Array.prototype.slice.call(arguments);
+  console.warn.apply(console, ["[premarket]"].concat(args));
+}
+
 // ── 設定 ───────────────────────────────────────────────────────────────
 function envStr(name, def) {
   var v = process.env[name];
   return (v == null || String(v).trim() === "") ? def : String(v).trim();
 }
 
-// 対象銘柄（カンマ区切り）。未設定ならトヨタ1銘柄だけを見る
-var CODES = envStr("PREMARKET_CODES", "7203")
-  .split(",")
-  .map(function (c) { return c.trim(); })
-  .filter(Boolean);
+// 対象銘柄の既定値。PREMARKET_CODES が未設定・空文字のときはこれをそのまま使う
+var DEFAULT_CODES = ["7203"];
+// 1ティックあたりの銘柄数の上限（PREMARKET_MAX の既定値）
+var DEFAULT_MAX_CODES = 8;
+
+// PREMARKET_CODES を銘柄コードの配列に直す。
+// ※銘柄コードには 278A のように英字を含む4桁コードがあるため、
+// 　parseInt / Number / isNaN による数値判定は絶対に行わず文字列のまま扱う。
+function parsePremarketCodes() {
+  var raw = process.env.PREMARKET_CODES;
+  if (raw == null || String(raw).trim() === "") return DEFAULT_CODES.slice();
+
+  var invalid = [];
+  var seen = {};
+  var codes = [];
+
+  String(raw)
+    .replace(/["']/g, "")             // ダブルクォート・シングルクォートを全て除去
+    .split(",")
+    .forEach(function (part) {
+      var code = String(part).trim();
+      if (code === "") return;        // 空要素（連続カンマ・末尾カンマ）は捨てる
+      code = code.toUpperCase();      // 278a → 278A
+      if (!/^[0-9A-Z]{4}$/.test(code)) { invalid.push(code); return; }
+      if (seen[code]) return;         // 重複は先に出てきた方を残す
+      seen[code] = true;
+      codes.push(code);               // 出現順を保持する（ソートは絶対にしない）
+    });
+
+  if (invalid.length) {
+    warn("PREMARKET_CODES に4桁英数字でない値があるため除外しました:", invalid.join(","));
+  }
+  // 全て弾かれた場合に空配列で走ると取得そのものが壊れるため、既定値へ戻す
+  if (codes.length === 0) {
+    warn("PREMARKET_CODES に有効な銘柄コードが1件もないため既定値を使います");
+    return DEFAULT_CODES.slice();
+  }
+  return codes;
+}
+
+// PREMARKET_MAX を整数として読む。未設定・不正値なら既定の8。
+// （こちらは銘柄コードではなく件数なので数値として扱ってよい）
+function parsePremarketMax() {
+  var raw = process.env.PREMARKET_MAX;
+  if (raw == null || String(raw).trim() === "") return DEFAULT_MAX_CODES;
+  var s = String(raw).trim();
+  if (!/^[0-9]+$/.test(s) || parseInt(s, 10) < 1) {
+    warn("PREMARKET_MAX が不正なため既定値(" + DEFAULT_MAX_CODES + ")を使います:", s);
+    return DEFAULT_MAX_CODES;
+  }
+  return parseInt(s, 10);
+}
+
+// 起動時に一度だけ確定させる。先頭から上限件数ぶんだけを採用する
+// （並び順がそのまま対象銘柄の選択になるため、環境変数側で優先順に並べておくこと）
+var RECEIVED_CODES = parsePremarketCodes();
+var MAX_CODES = parsePremarketMax();
+var CODES = RECEIVED_CODES.slice(0, MAX_CODES);
+
+if (RECEIVED_CODES.length > CODES.length) {
+  warn("上限を超えたため切り捨てました:", RECEIVED_CODES.slice(MAX_CODES).join(","));
+}
+log("対象 " + CODES.length + "件 / 受領 " + RECEIVED_CODES.length + "件 / 上限 " +
+  MAX_CODES + "件 → " + CODES.join(","));
 
 var API_BASE = envStr("VERCEL_API_BASE", "https://daytrade-simulator.vercel.app").replace(/\/+$/, "");
 
@@ -122,7 +188,8 @@ async function postLog(payload) {
 }
 
 // ── 当日ぶんの収集ループ ─────────────────────────────────────────────────
-var running = false;
+var running = false;   // セッションの多重起動防止（tick用）
+var fetching = false;  // 1ティックの取得が進行中か（runSessionを直接呼ばれた場合の保険）
 
 async function runSession() {
   var date = jstDateString();
@@ -136,11 +203,31 @@ async function runSession() {
     if (jstDateString() !== date) break;          // 日付が変わったら終了（念のため）
     if (jstMinuteOfDay(d) >= END_MINUTE) break;   // 9:06になったら終了
 
-    var rec = await fetchOnce();
+    // 前のティックがまだ終わっていなければ今回は取得しない（多重起動の防止）
+    if (fetching) {
+      warn("前のティックが未完了のためスキップします");
+      await sleep(FETCH_INTERVAL_MS);
+      continue;
+    }
+
+    fetching = true;
+    var rec;
+    try {
+      rec = await fetchOnce();
+    } finally {
+      fetching = false;
+    }
     records.push(rec);
 
+    // 1ティックの所要時間。銘柄を増やしすぎて15秒に収まらなくなったらここで気づける
+    var elapsed = Date.now() - rec.ts;
+    log("tick " + CODES.length + "銘柄 / " + elapsed + "ms");
+    if (elapsed >= FETCH_INTERVAL_MS) {
+      warn("1ティックが取得間隔(" + FETCH_INTERVAL_MS + "ms)を超えました。銘柄数を減らしてください");
+    }
+
     // 取得にかかった時間ぶん差し引いて、15秒間隔を保つ
-    var wait = FETCH_INTERVAL_MS - (Date.now() - rec.ts);
+    var wait = FETCH_INTERVAL_MS - elapsed;
     await sleep(wait > 0 ? wait : 0);
   }
 
