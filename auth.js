@@ -88,17 +88,20 @@ var SEND_GAP_MS = parseInt(process.env.TACHIBANA_SEND_GAP_MS || "15", 10);
 // リトライ時の間隔。後続の採番を長めに止めて「追い越されない」状態を作ってから再送する
 var RETRY_GAP_MS = parseInt(process.env.TACHIBANA_RETRY_GAP_MS || "150", 10);
 var PNO_RETRY_MAX = 2; // p_errno=6 が返ったときに採番し直して再送する最大回数
+// 立花証券へのPOST1回あたりのタイムアウト既定値。
+// 全銘柄マスタ等の重い応答でも実測4秒程度なので10秒あれば足りる。
+var POST_TIMEOUT_MS = 10000;
 
 function sleep(ms) {
   return new Promise(function (resolve) { setTimeout(resolve, ms); });
 }
 
 // 採番と送信開始だけを直列化してPOSTする（1回のみ。リトライはrequest側で行う）
-function postSerialized(url, paramsObj, gapMs) {
+function postSerialized(url, paramsObj, gapMs, timeoutMs) {
   // gate は「採番 → 送信開始 → 次の採番までの間隔」まで待つPromise
   var gate = sendChain.then(function () {
     var params = Object.assign(nextHeader(), paramsObj);
-    var resPromise = postToServer(url, params); // ここで送信が始まる
+    var resPromise = postToServer(url, params, timeoutMs); // ここで送信が始まる
     resPromise.catch(function () {}); // 応答は下段で待つので、未処理拒否の警告だけ防ぐ
     return sleep(gapMs).then(function () {
       // 応答Promiseはオブジェクトに包む（thenで自動的に待たれてしまうのを防ぐため）
@@ -125,11 +128,11 @@ function extractServerPno(ans) {
 }
 
 // p_errno=6（通番エラー）が返った場合は採番し直して最大PNO_RETRY_MAX回リトライする。
-async function requestWithPnoRetry(url, paramsObj) {
+async function requestWithPnoRetry(url, paramsObj, timeoutMs) {
   var ans = null;
   for (var attempt = 0; attempt <= PNO_RETRY_MAX; attempt++) {
     // 2回目以降は間隔を広げて送る（後続の採番を止めている間に確実に到着させるため）
-    ans = await postSerialized(url, paramsObj, attempt === 0 ? SEND_GAP_MS : RETRY_GAP_MS);
+    ans = await postSerialized(url, paramsObj, attempt === 0 ? SEND_GAP_MS : RETRY_GAP_MS, timeoutMs);
     if (String(ans && ans.p_errno) !== "6") return ans;
     // サーバーが受け付け済みの通番より確実に大きい値から採番し直す
     var serverPno = extractServerPno(ans);
@@ -165,9 +168,10 @@ function urlKeyOf(target) {
 
 // 立花証券APIへのリクエスト共通入口。p_no は内部で採番するので呼び出し側は業務パラメータのみ渡す。
 // 通番エラー(p_errno=6)のリトライに加え、セッション切断(p_errno=2)なら再ログインして1回だけ再送する。
-async function request(url, paramsObj) {
+// timeoutMs はPOST1回あたりのタイムアウト（省略時10秒）。再送にも同じ値が効く。
+async function request(url, paramsObj, timeoutMs) {
   var sentAt = Date.now();
-  var ans = await requestWithPnoRetry(url, paramsObj);
+  var ans = await requestWithPnoRetry(url, paramsObj, timeoutMs);
   // ログイン要求自体はここで再ログインさせない（無限ループになるため）
   if (String(ans && ans.p_errno) !== "2" || paramsObj.sCLMID === "CLMAuthLoginRequest") return ans;
 
@@ -177,7 +181,7 @@ async function request(url, paramsObj) {
     // 送信後に別のリクエストが再ログイン済みなら、そのセッションで再送するだけでよい
     var urls = state.loadedAt > sentAt ? state.urls : await reLoginShared();
     // リトライは1回だけ。ここでは request ではなく requestWithPnoRetry を呼ぶので再帰しない
-    var retry = await requestWithPnoRetry((key && urls && urls[key]) || url, paramsObj);
+    var retry = await requestWithPnoRetry((key && urls && urls[key]) || url, paramsObj, timeoutMs);
     if (String(retry && retry.p_errno) !== "0") {
       var err = new Error("p_errno=" + (retry && retry.p_errno) + " p_err=" + (retry && retry.p_err));
       err.answer = retry;
@@ -192,15 +196,33 @@ async function request(url, paramsObj) {
 }
 
 // 立花証券サーバーへPOST（応答はShiftJISで返ってくる）
-async function postToServer(url, paramsObj) {
-  var res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(paramsObj),
-  });
-  var buf = Buffer.from(await res.arrayBuffer());
-  var text = iconv.decode(buf, "Shift_JIS");
-  return JSON.parse(text);
+// 素のfetchはタイムアウトを持たないため、立花側が無応答になると呼び出し側が
+// 無期限にブロックする（寄り前の気配収集が1ティックで止まる原因になる）。
+// 必ず AbortSignal.timeout() を付け、時間切れは例外にして呼び出し側のエラー処理に載せる。
+// timeoutMs を渡せば既定値(10秒)を上書きできる（応答が重い用途向けの逃げ道）。
+async function postToServer(url, paramsObj, timeoutMs) {
+  var timeout = timeoutMs != null ? timeoutMs : POST_TIMEOUT_MS;
+  try {
+    var res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(paramsObj),
+      signal: AbortSignal.timeout(timeout),
+    });
+    // 本文の読み込み中に時間切れになることもあるため、ここまでtryに含める
+    var buf = Buffer.from(await res.arrayBuffer());
+    var text = iconv.decode(buf, "Shift_JIS");
+    return JSON.parse(text);
+  } catch (e) {
+    // タイムアウトは TimeoutError（実装によっては AbortError）で飛んでくる
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      console.warn("[tachibana] postToServer タイムアウト（" + timeout + "ms）");
+      var err = new Error("立花証券APIへのPOSTがタイムアウトしました（" + timeout + "ms）");
+      err.name = "TimeoutError";
+      throw err;
+    }
+    throw e;
+  }
 }
 
 function checkAnswer(ans) {
