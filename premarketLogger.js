@@ -93,8 +93,20 @@ var RECEIVED_CODES = parsePremarketCodes();
 var MAX_CODES = parsePremarketMax();
 var CODES = RECEIVED_CODES.slice(0, MAX_CODES);
 
+// 切り捨てログに載せる先頭の件数
+var DROPPED_PREVIEW = 3;
+
+// 上限で切り捨てた銘柄は「件数＋先頭3件＋残り件数」だけを出す。
+// 全件を1行に並べると100件以上が流れてログが埋まるため。
+// またこれは設定どおりの正常動作なので、Railwayで[err]扱いになる warn ではなく log で出す。
 if (RECEIVED_CODES.length > CODES.length) {
-  warn("上限を超えたため切り捨てました:", RECEIVED_CODES.slice(MAX_CODES).join(","));
+  var dropped = RECEIVED_CODES.slice(MAX_CODES);
+  var droppedMsg = "上限により" + dropped.length + "件を切り捨てました: " +
+    dropped.slice(0, DROPPED_PREVIEW).join(",");
+  if (dropped.length > DROPPED_PREVIEW) {
+    droppedMsg += " ...他" + (dropped.length - DROPPED_PREVIEW) + "件";
+  }
+  log(droppedMsg);
 }
 log("対象 " + CODES.length + "件 / 受領 " + RECEIVED_CODES.length + "件 / 上限 " +
   MAX_CODES + "件 → " + CODES.join(","));
@@ -104,7 +116,7 @@ var API_BASE = envStr("VERCEL_API_BASE", "https://daytrade-simulator.vercel.app"
 var START_MINUTE = 8 * 60 + 45; // 8:45:00 から
 var END_MINUTE = 9 * 60 + 6;    // 9:06:00 まで
 var FETCH_INTERVAL_MS = 15 * 1000;   // 取得間隔
-var TICK_INTERVAL_MS = 60 * 1000;    // 時間外は1分ごとに時刻だけ見る
+var TICK_INTERVAL_MS = 15 * 1000;    // 窓に入ったかを15秒ごとに見る（日時判定のみ・APIは叩かない）
 var POST_TIMEOUT_MS = 30 * 1000;
 var POST_MAX_ATTEMPTS = 3;
 
@@ -206,6 +218,7 @@ async function postLog(payload) {
 // ── 当日ぶんの収集ループ ─────────────────────────────────────────────────
 var running = false;   // セッションの多重起動防止（tick用）
 var fetching = false;  // 1ティックの取得が進行中か（runSessionを直接呼ばれた場合の保険）
+var lastSessionDate = null; // 収集を走らせ終えた日（JSTのYYYY-MM-DD）。同じ日に2回走らせないため
 
 async function runSession() {
   var date = jstDateString();
@@ -271,26 +284,41 @@ function isInWindow(d) {
   return m >= START_MINUTE && m < END_MINUTE;
 }
 
-// 時間外は1分ごとに時刻を見るだけ。窓に入ったら収集ループへ入る。
-// running フラグで多重起動を防ぐ（起動直後の即時開始と毎分判定が重ならないように）。
+// 15秒ごとに時刻を見るだけ。窓に入ったら収集ループへ入る。
+// 二重起動の防止は次の2段構え。
+// ・running … tick は setInterval のコールバックなので同期的に実行される。
+// 　runSession() を呼ぶ前に同期で true にし、Promiseが決着してから false に戻すので、
+// 　15秒後のtickが割り込んでも必ず true を見て即returnする（収集中の再入は起きない）。
+// ・lastSessionDate … その日ぶんを走らせ終えたら日付を記録し、同じ日は二度と入らない。
+// 　窓の終了(9:06)で抜けた後だけでなく、runSessionが即座に落ちた場合でも
+// 　15秒ごとに再突入を繰り返さない。
 function tick() {
   if (running) return;
   if (!isInWindow(nowJst())) return;
 
+  var date = jstDateString();
+  if (lastSessionDate === date) return; // 当日ぶんは収集済み
+
   running = true;
   runSession()
     .catch(function (e) { log("予期しないエラー:", e.message); })
-    .then(function () { running = false; });
+    .then(function () {
+      lastSessionDate = date;
+      running = false;
+    });
 }
 
 function start() {
   log("起動しました。8:45〜9:06(JST/平日) に15秒間隔で取得します。宛先:", API_BASE);
 
-  // 毎分の判定。窓外からの通常の開始はこちらが担当する。
+  // 窓に入ったかの判定。窓外からの通常の開始はこちらが担当する。
+  // 60秒間隔だとコンテナの起動秒数によって窓の頭が最大59秒欠測していたため、
+  // 収集間隔と同じ15秒まで縮めて検知遅れを最大1ティックぶんに抑える。
+  // 窓外で走るのは日時計算だけで、立花APIへのアクセスは一切発生しない。
   setInterval(tick, TICK_INTERVAL_MS);
 
-  // 起動が窓の途中だった場合、次の分境界まで待つと最大60秒ぶん取り逃す。
-  // 分境界を待たず、その場で1回だけ判定して即座に収集を始める。
+  // 起動が窓の途中だった場合、次の判定まで待つとそのぶん取り逃す。
+  // 判定間隔を待たず、その場で1回だけ判定して即座に収集を始める。
   if (isInWindow(nowJst())) {
     log("起動時に窓内のため即時開始します");
     tick();
