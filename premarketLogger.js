@@ -28,6 +28,13 @@ function warn() {
   console.warn.apply(console, ["[premarket]"].concat(args));
 }
 
+// 異常終了のように「本来起きてはいけないこと」だけに使う。
+// Railwayでは stderr が [err] に分類されるため、後から拾いやすい。
+function error() {
+  var args = Array.prototype.slice.call(arguments);
+  console.error.apply(console, ["[premarket]"].concat(args));
+}
+
 // ── 設定 ───────────────────────────────────────────────────────────────
 function envStr(name, def) {
   var v = process.env[name];
@@ -284,14 +291,37 @@ function isInWindow(d) {
   return m >= START_MINUTE && m < END_MINUTE;
 }
 
+// 異常終了ログ用にエラーメッセージを取り出す。
+// Errorではないもの（null・文字列・オブジェクト）で reject された場合でも
+// 必ず何らかの文字列を返す。ここで例外を出してログ行そのものを落とさないため。
+function errorMessage(e) {
+  var msg = "";
+  try {
+    if (e && typeof e.message === "string" && e.message !== "") {
+      msg = e.message;
+    } else if (typeof e === "string" && e !== "") {
+      msg = e;
+    } else if (e !== null && e !== undefined) {
+      msg = String(e);
+    }
+  } catch (inner) {
+    msg = "";
+  }
+  return msg !== "" ? msg : "(エラーメッセージ取得不可)";
+}
+
 // 15秒ごとに時刻を見るだけ。窓に入ったら収集ループへ入る。
 // 二重起動の防止は次の2段構え。
 // ・running … tick は setInterval のコールバックなので同期的に実行される。
 // 　runSession() を呼ぶ前に同期で true にし、Promiseが決着してから false に戻すので、
 // 　15秒後のtickが割り込んでも必ず true を見て即returnする（収集中の再入は起きない）。
+// 　解除は必ず .finally() で行う。.then() だけだと runSession() が reject したときや
+// 　catch のハンドラ自身が転んだときに false へ戻らず、running が true のまま固着して
+// 　翌日以降も窓の頭で即returnし続ける（再デプロイするまで永久にデータが取れない）。
 // ・lastSessionDate … その日ぶんを走らせ終えたら日付を記録し、同じ日は二度と入らない。
 // 　窓の終了(9:06)で抜けた後だけでなく、runSessionが即座に落ちた場合でも
-// 　15秒ごとに再突入を繰り返さない。
+// 　15秒ごとに再突入を繰り返さない。同一日の再突入を塞ぐのはこちらの役目で、
+// 　running ではない（runningは決着と同時に必ず解除される）。
 function tick() {
   if (running) return;
   if (!isInWindow(nowJst())) return;
@@ -301,10 +331,15 @@ function tick() {
 
   running = true;
   runSession()
-    .catch(function (e) { log("予期しないエラー:", e.message); })
-    .then(function () {
-      lastSessionDate = date;
-      running = false;
+    .catch(function (e) {
+      // 途中で落ちた場合は方針どおり本日分を諦めるが、黙って諦めると
+      // 翌朝データが無い理由が分からなくなるため必ず1行残す。
+      error("セッション異常終了。本日分（" + date + "）は中止します: " + errorMessage(e));
+    })
+    .finally(function () {
+      // 成功・失敗のどちらでも必ずここを通す。
+      lastSessionDate = date; // 異常終了でも当日分は打ち切り（同一日の再突入を塞ぐ）
+      running = false;        // 次の日の窓では通常どおり開始できる
     });
 }
 
