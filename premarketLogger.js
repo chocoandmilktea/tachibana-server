@@ -152,6 +152,43 @@ function sleep(ms) {
   return new Promise(function (r) { setTimeout(r, ms); });
 }
 
+// ── tick失敗の記録 ─────────────────────────────────────────────────────
+// 立花APIはHTTPステータス200のまま本文の p_errno / p_err にエラーを載せて返すため、
+// 「通ったか」ではなく「本文に何が書いてあったか」を残す。
+// PREMARKET_MAX を増やしたときに「銘柄数×項目数」の制限へ当たったのかどうかを、
+// Railwayのログだけで切り分けられるようにするのが目的。
+var TICK_ERROR_LOG_MAX = 5; // 1セッションあたりの出力上限（同じエラーの連発でログが埋まるのを防ぐ）
+var TICK_ERROR_BODY_MAX = 200; // 本文をこの文字数で切る
+var tickErrorLogCount = 0;  // セッション開始時に0へ戻す
+
+// 立花の生レスポンスから p_errno（無ければ p_err）を取り出す。無ければ null。
+function pickErrno(answer) {
+  if (!answer || typeof answer !== "object") return null;
+  if (answer.p_errno != null && String(answer.p_errno) !== "") return String(answer.p_errno);
+  if (answer.p_err != null && String(answer.p_err) !== "") return String(answer.p_err);
+  return null;
+}
+
+// 本文を1行に潰して先頭200文字だけ返す（改行が混ざるとログが複数行に割れるため）
+function bodyPreview(answer, fallback) {
+  var text = "";
+  try {
+    text = answer != null ? JSON.stringify(answer) : "";
+  } catch (e) {
+    text = ""; // 循環参照などで文字列化できない場合はエラーメッセージ側で代用する
+  }
+  if (text === "" || text === undefined) text = String(fallback == null ? "" : fallback);
+  return text.replace(/\s+/g, " ").slice(0, TICK_ERROR_BODY_MAX);
+}
+
+// 失敗の内容を1行だけ console.error に出す（warnはRailwayの[err]と区別が付かなくなるため使わない）
+function logTickFailure(answer, fallback) {
+  if (tickErrorLogCount >= TICK_ERROR_LOG_MAX) return; // 上限を超えたら黙って捨てる
+  tickErrorLogCount++;
+  var errno = pickErrno(answer);
+  error("tick失敗: p_errno=" + (errno == null ? "-" : errno) + " / " + bodyPreview(answer, fallback));
+}
+
 // ── 取得 ───────────────────────────────────────────────────────────────
 // 1回ぶんの取得。成功時は { ts, raw }、失敗時は { ts, error } を返す。
 // セッションが未確立で ensureSession() が失敗した場合（8:30のメンテ明け直後など）も
@@ -162,8 +199,18 @@ async function fetchOnce() {
     var session = await auth.ensureSession();
     if (!session || !session.sUrlPrice) throw new Error("立花セッションが未確立です");
     var rows = await webapi.fetchBatchPrice(session, CODES, webapi.DEFAULT_COLS);
+    // 通常は webapi 側の checkAnswer が p_errno!=0 を例外にするが、
+    // 万一エラー本文がそのまま戻ってきた場合もHTTP成功と見なさずエラー扱いにする
+    var errno = pickErrno(rows);
+    if (errno != null && errno !== "0") {
+      logTickFailure(rows, null);
+      return { ts: ts, error: "立花APIエラー p_errno=" + errno };
+    }
     return { ts: ts, raw: rows };
   } catch (e) {
+    // webapi.fetchBatchPrice は立花の生レスポンスを e.answer に付けて投げてくれる。
+    // 取れなかった場合（通信断・タイムアウト等）はエラーメッセージを本文の代わりに出す。
+    logTickFailure(e && e.answer, e && e.message);
     return { ts: ts, error: e.message };
   }
 }
@@ -231,6 +278,8 @@ async function runSession() {
   var date = jstDateString();
   var startedAt = Date.now();
   var records = [];
+
+  tickErrorLogCount = 0; // tick失敗ログの抑止カウンタはセッションごとに戻す
 
   log("開始:", date, "対象:", CODES.join(","), "カラム:", webapi.DEFAULT_COLS);
 
