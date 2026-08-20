@@ -153,6 +153,52 @@ function sleep(ms) {
 }
 
 // ── 取得 ───────────────────────────────────────────────────────────────
+// 立花APIはHTTP 200のまま本文に p_errno / p_err を載せてエラーを返すため、
+// ステータスだけで成功と判定してはいけない。実際の判定は
+// webapi.fetchBatchPrice → auth.checkAnswer が本文を見て行い、
+// 失敗時は立花の生レスポンスを e.answer に添えて throw してくる。
+// 「銘柄数 × 項目数 ≦ 200」のような列数制限に当たったとき、
+// 通らなかった理由をその場で拾えるように本文の先頭を残す。
+var TICK_ERROR_LOG_MAX = 5;  // 1セッションあたりの出力上限（同一エラー連発でログが埋まるのを防ぐ）
+var TICK_BODY_CHARS = 200;   // 本文から切り出す文字数
+var tickErrorLogged = 0;     // 出力済み件数。セッション開始時に0へ戻す
+
+// 改行・タブを潰して1行にする（Railwayのログで1エラー1行に収めるため）
+function oneLine(s) {
+  return String(s).replace(/[\r\n\t]+/g, " ");
+}
+
+// tickの取得が失敗したときに、p_errno と本文の先頭200文字を1行だけ残す。
+// 正常系と区別できるよう console.warn ではなく console.error を使う。
+function logTickFailure(e) {
+  if (tickErrorLogged >= TICK_ERROR_LOG_MAX) return; // 上限に達したら6回目以降は抑止
+  tickErrorLogged++;
+
+  var ans = e && e.answer; // 立花の生レスポンス（webapi側で添付される）
+  var pErrno = "-";
+  var body = "";
+
+  if (ans != null) {
+    if (ans.p_errno != null) pErrno = String(ans.p_errno);
+    try {
+      body = JSON.stringify(ans);
+    } catch (inner) {
+      body = errorMessage(e); // 循環参照などで文字列化できない場合はメッセージで代用
+    }
+  } else {
+    // 応答そのものが取れなかった場合（通信断・タイムアウト・セッション未確立）
+    body = errorMessage(e);
+  }
+
+  // 応答が添付されていなくても、メッセージ側に p_errno が載っていれば拾う
+  if (pErrno === "-") {
+    var m = /p_errno=(\S+)/.exec(errorMessage(e));
+    if (m) pErrno = m[1];
+  }
+
+  error("tick失敗: p_errno=" + pErrno + " / " + oneLine(body).slice(0, TICK_BODY_CHARS));
+}
+
 // 1回ぶんの取得。成功時は { ts, raw }、失敗時は { ts, error } を返す。
 // セッションが未確立で ensureSession() が失敗した場合（8:30のメンテ明け直後など）も
 // ここでerrorとして記録し、次の15秒後に自然に再試行される。
@@ -164,6 +210,7 @@ async function fetchOnce() {
     var rows = await webapi.fetchBatchPrice(session, CODES, webapi.DEFAULT_COLS);
     return { ts: ts, raw: rows };
   } catch (e) {
+    logTickFailure(e); // 「通らなかった理由」を本文ごと残す（1セッション最大5回）
     return { ts: ts, error: e.message };
   }
 }
@@ -231,6 +278,7 @@ async function runSession() {
   var date = jstDateString();
   var startedAt = Date.now();
   var records = [];
+  tickErrorLogged = 0; // tick失敗ログの抑止カウンタはセッション開始時にリセットする
 
   log("開始:", date, "対象:", CODES.join(","), "カラム:", webapi.DEFAULT_COLS);
 
