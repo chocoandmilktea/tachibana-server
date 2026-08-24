@@ -23,9 +23,12 @@ function log() {
   console.log.apply(console, ["[premarket]"].concat(args));
 }
 
+// 警告。Railwayでは console.warn も console.error と同じ [err] に分類されるため、
+// 正常系の通知（設定の読み替え・スキップなど）まで障害ログに混ざってしまう。
+// そこで内部では console.log を使い、代わりに [warn] を付けて目視で区別できるようにする。
 function warn() {
   var args = Array.prototype.slice.call(arguments);
-  console.warn.apply(console, ["[premarket]"].concat(args));
+  console.log.apply(console, ["[premarket] [warn]"].concat(args));
 }
 
 // 「本来起きてはいけないこと」（セッションの異常終了・ティックの失敗）だけに使う。
@@ -105,7 +108,7 @@ var DROPPED_PREVIEW = 3;
 
 // 上限で切り捨てた銘柄は「件数＋先頭3件＋残り件数」だけを出す。
 // 全件を1行に並べると100件以上が流れてログが埋まるため。
-// またこれは設定どおりの正常動作なので、Railwayで[err]扱いになる warn ではなく log で出す。
+// またこれは設定どおりの正常動作なので、警告ではなく log で出す。
 if (RECEIVED_CODES.length > CODES.length) {
   var dropped = RECEIVED_CODES.slice(MAX_CODES);
   var droppedMsg = "上限により" + dropped.length + "件を切り捨てました: " +
@@ -126,6 +129,16 @@ var FETCH_INTERVAL_MS = 15 * 1000;   // 取得間隔
 var TICK_INTERVAL_MS = 15 * 1000;    // 窓に入ったかを15秒ごとに見る（日時判定のみ・APIは叩かない）
 var POST_TIMEOUT_MS = 30 * 1000;
 var POST_MAX_ATTEMPTS = 3;
+
+// POSTサイズの警告閾値（KB）。
+// ・ペイロードは 19.58KB/銘柄（2026-08-24 実測: 100銘柄 = 1958KB）
+// ・PREMARKET_MAX=158（全件）でも約3.09MB（3168KB）で収まる見込み
+// ・Vercelの上限は4.5MB＝4500KB
+// 旧実装の1MB固定は全件運用では毎営業日必ず超えて[err]が出続け、
+// 真の障害が埋もれていたため、全件運用の上に警戒線を置き直した。
+var POST_SIZE_WARN_KB = 3500;    // 警戒線。ここを超えたら warn（正常系ログ扱い）
+var POST_SIZE_ERROR_KB = 4000;   // 上限接近。ここを超えたら error（[err] のまま残す）
+var POST_SIZE_LIMIT_KB = 4500;   // Vercelのリクエストボディ上限
 
 // tick失敗ログは同一セッション内で先頭この件数までしか出さない。
 // 立花が落ちている朝は84ティック全部が失敗しうるため、原因が分かる先頭数件だけ残す。
@@ -236,10 +249,14 @@ function authHeaders() {
 // 文字数ではなくバイト数で測る（銘柄名などマルチバイト文字が入るため）。
 function logPayloadSize(payload, body) {
   var bytes = Buffer.byteLength(body, "utf8");
+  var kb = Math.round(bytes / 1024);
   log("POST " + (payload.codes || []).length + "銘柄 / " +
-    Math.round(bytes / 1024) + "KB / " + (payload.records || []).length + "レコード");
-  if (bytes > 1024 * 1024) {
-    warn("POSTサイズが1MBを超えました（Vercel上限4.5MB）");
+    kb + "KB / " + (payload.records || []).length + "レコード");
+  // 上限接近だけを[err]に残す。警戒線どまりのうちは正常系のログとして出す
+  if (kb >= POST_SIZE_ERROR_KB) {
+    error("POSTサイズが上限に接近しています " + kb + "KB（Vercel上限" + POST_SIZE_LIMIT_KB + "KB）");
+  } else if (kb >= POST_SIZE_WARN_KB) {
+    warn("POSTサイズ " + kb + "KB（Vercel上限" + POST_SIZE_LIMIT_KB + "KB）");
   }
 }
 
