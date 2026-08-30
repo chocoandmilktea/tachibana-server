@@ -10,9 +10,12 @@
 // ・立花の戻り値は一切加工しない（後から何が取れていたのかを検証するため）
 // ・エラーも握りつぶさず同じ配列に積む（ログイン未確立・カラム不正の切り分け用）
 // ・時刻判定は必ずJST。Railwayのサーバー時刻はUTCなので、サーバーのTZに依存させない
-// ・15秒×21分＝1日あたり約84レコード。1ティック1リクエストなので間引きも圧縮もしない
+// ・15秒×21分＝1日あたり約84レコード。間引きも圧縮もしない
 // ・対象銘柄は環境変数 PREMARKET_CODES で差し替える。ただし1ティックを15秒に
 // 　収めるため PREMARKET_MAX（既定8）で件数に上限を掛ける
+// ・立花の /market-price は1要求につき先頭120件までしか返さない。それを超える件数を
+// 　1回で投げると121件目以降が黙って捨てられるため、PREMARKET_CHUNK_SIZE（既定80）
+// 　件ずつに割って直列で投げ、応答を連結して1ティック＝1レコードにまとめる
 
 var auth = require("./auth");
 var config = require("./config");
@@ -48,6 +51,9 @@ function envStr(name, def) {
 var DEFAULT_CODES = ["7203"];
 // 1ティックあたりの銘柄数の上限（PREMARKET_MAX の既定値）
 var DEFAULT_MAX_CODES = 8;
+// 1回の要求で立花へ渡す銘柄数（PREMARKET_CHUNK_SIZE の既定値）。
+// 立花の応答上限120件に対して余裕を取った値
+var DEFAULT_CHUNK_SIZE = 80;
 
 // PREMARKET_CODES を銘柄コードの配列に直す。
 // ※銘柄コードには 278A のように英字を含む4桁コードがあるため、
@@ -97,14 +103,30 @@ function parsePremarketMax() {
   return parseInt(s, 10);
 }
 
+// PREMARKET_CHUNK_SIZE を整数として読む。未設定・不正値なら既定の80。
+// PREMARKET_MAX と同じ扱い（起動時に一度だけ確定・件数なので数値として扱う）。
+function parsePremarketChunkSize() {
+  var raw = process.env.PREMARKET_CHUNK_SIZE;
+  if (raw == null || String(raw).trim() === "") return DEFAULT_CHUNK_SIZE;
+  var s = String(raw).trim();
+  if (!/^[0-9]+$/.test(s) || parseInt(s, 10) < 1) {
+    warn("PREMARKET_CHUNK_SIZE が不正なため既定値(" + DEFAULT_CHUNK_SIZE + ")を使います:", s);
+    return DEFAULT_CHUNK_SIZE;
+  }
+  return parseInt(s, 10);
+}
+
 // 起動時に一度だけ確定させる。先頭から上限件数ぶんだけを採用する
 // （並び順がそのまま対象銘柄の選択になるため、環境変数側で優先順に並べておくこと）
 var RECEIVED_CODES = parsePremarketCodes();
 var MAX_CODES = parsePremarketMax();
 var CODES = RECEIVED_CODES.slice(0, MAX_CODES);
+var CHUNK_SIZE = parsePremarketChunkSize();
 
 // 切り捨てログに載せる先頭の件数
 var DROPPED_PREVIEW = 3;
+// 件数不一致のログに載せる欠落銘柄コードの先頭の件数
+var MISMATCH_PREVIEW = 5;
 
 // 上限で切り捨てた銘柄は「件数＋先頭3件＋残り件数」だけを出す。
 // 全件を1行に並べると100件以上が流れてログが埋まるため。
@@ -119,7 +141,7 @@ if (RECEIVED_CODES.length > CODES.length) {
   log(droppedMsg);
 }
 log("対象 " + CODES.length + "件 / 受領 " + RECEIVED_CODES.length + "件 / 上限 " +
-  MAX_CODES + "件 → " + CODES.join(","));
+  MAX_CODES + "件 / 分割 " + CHUNK_SIZE + "件 → " + CODES.join(","));
 
 var API_BASE = envStr("VERCEL_API_BASE", "https://daytrade-simulator.vercel.app").replace(/\/+$/, "");
 
@@ -172,19 +194,98 @@ function sleep(ms) {
 }
 
 // ── 取得 ───────────────────────────────────────────────────────────────
-// 1回ぶんの取得。成功時は { ts, raw }、失敗時は { ts, error } を返す。
+// 配列を size 件ずつに割る。
+// webapi.js のランキング取得も同じ考え方で120件ずつに割っているが、
+// あちらの chunk() は非公開なのでここに同じものを持つ。
+function chunkCodes(arr, size) {
+  var out = [];
+  for (var i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// 要求した銘柄コードのうち、応答に1行も出てこなかったものを返す。
+// 立花の応答の並びが要求順と一致する保証はコード上どこにも無いため、
+// 位置ではなく銘柄コードの集合で突き合わせる。
+// 応答行のコードは sIssueCode。大文字に寄せてから比べる（CODES は既に大文字）。
+function missingCodes(requested, rows) {
+  var seen = {};
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row) continue;
+    var code = toText(row.sIssueCode).trim().toUpperCase();
+    if (code) seen[code] = true;
+  }
+  return requested.filter(function (c) { return !seen[c]; });
+}
+
+// 1回ぶんの取得。対象銘柄を CHUNK_SIZE 件ずつに割り、直列で立花へ投げて応答を連結する。
+// 戻り値は { record, chunkCount, failedChunks, firstError, mismatches }。
+// record の形（成功時 { ts, raw } / 失敗時 { ts, error }）は従来から変えない。
+// Vercel側（api/sync.js の premarket-summary）がこの形に依存しているため。
 // セッションが未確立で ensureSession() が失敗した場合（8:30のメンテ明け直後など）も
 // ここでerrorとして記録し、次の15秒後に自然に再試行される。
 async function fetchOnce() {
   var ts = Date.now();
+  var session;
   try {
-    var session = await auth.ensureSession();
+    session = await auth.ensureSession();
     if (!session || !session.sUrlPrice) throw new Error("立花セッションが未確立です");
-    var rows = await webapi.fetchBatchPrice(session, CODES, webapi.DEFAULT_COLS);
-    return { ts: ts, raw: rows };
   } catch (e) {
-    return { ts: ts, error: e.message };
+    // セッションが無い時点で分割以前の問題なので、1チャンクぶんの失敗として扱う
+    var reason = errorMessage(e);
+    return {
+      record: { ts: ts, error: reason },
+      chunkCount: 1, failedChunks: 1, firstError: reason, mismatches: [],
+    };
   }
+
+  var groups = chunkCodes(CODES, CHUNK_SIZE);
+  var rows = [];
+  var okChunks = 0;
+  var failedChunks = 0;
+  var firstError = "";
+  var mismatches = [];
+
+  for (var i = 0; i < groups.length; i++) {
+    var group = groups[i];
+    try {
+      // 必ず直列で投げる。立花は送信ごとに p_no を採番しており、
+      // 並列化して到着順が入れ替わると p_errno=6 で弾かれるため。
+      var part = await webapi.fetchBatchPrice(session, group, webapi.DEFAULT_COLS);
+      if (!Array.isArray(part)) part = [];
+      okChunks++;
+      // 連結は応答の並びのまま（要求順に並べ替えない）
+      for (var j = 0; j < part.length; j++) rows.push(part[j]);
+      // 要求件数と応答件数の突き合わせ。これは「失敗」ではないので別枠で数える
+      if (part.length !== group.length) {
+        mismatches.push({
+          index: i + 1,
+          requested: group.length,
+          received: part.length,
+          missing: missingCodes(group, part),
+        });
+      }
+    } catch (e) {
+      // 1つのチャンクが失敗しても残りは続ける。取れたぶんの行は捨てない
+      failedChunks++;
+      if (firstError === "") {
+        firstError = "チャンク" + (i + 1) + "/" + groups.length + ": " + errorMessage(e);
+      }
+    }
+  }
+
+  // 全チャンクが失敗したときだけ、従来どおりのエラーレコード形式にする。
+  // 1つでも通っていれば取れた行を raw として残す
+  if (okChunks === 0) {
+    return {
+      record: { ts: ts, error: firstError !== "" ? firstError : "全チャンクの取得に失敗しました" },
+      chunkCount: groups.length, failedChunks: failedChunks, firstError: firstError, mismatches: mismatches,
+    };
+  }
+  return {
+    record: { ts: ts, raw: rows },
+    chunkCount: groups.length, failedChunks: failedChunks, firstError: firstError, mismatches: mismatches,
+  };
 }
 
 // ── ティックの失敗判定 ───────────────────────────────────────────────────
@@ -304,7 +405,11 @@ async function runSession() {
   var date = jstDateString();
   var startedAt = Date.now();
   var records = [];
-  var tickErrorCount = 0; // このセッション内でティックが失敗した回数（ログの抑制と件数報告に使う）
+  var tickErrorCount = 0;    // このセッション内で失敗した回数。分割後はチャンク単位で数える
+  var tickErrorLogCount = 0; // 失敗ログを出した回数。tickErrorCount はチャンク単位で増えるため、
+                             // 「先頭3ティックぶんだけ出す」という抑制はこちらで判定する
+  var mismatchTickCount = 0; // 要求件数と応答件数が食い違ったティック数（失敗とは別枠）
+  var mismatchLogged = false; // 不一致の詳細ログはセッション内で最初の1回だけ出す
 
   log("開始:", date, "対象:", CODES.join(","), "カラム:", webapi.DEFAULT_COLS);
 
@@ -321,22 +426,51 @@ async function runSession() {
     }
 
     fetching = true;
-    var rec;
+    var res;
     try {
-      rec = await fetchOnce();
+      res = await fetchOnce();
     } finally {
       fetching = false;
     }
+    var rec = res.record;
     records.push(rec);
 
     // 失敗したティックは「通らなかった」ことだけでなく原因も残す。
     // ただし先頭 TICK_ERROR_LOG_LIMIT 件までで、以降は件数だけ数えて抑制する
     // （収集終了時にまとめて出す）。成功時のログは一切増やさない。
-    var tickError = tickErrorReason(rec);
-    if (tickError) {
-      tickErrorCount++;
-      if (tickErrorCount <= TICK_ERROR_LOG_LIMIT) {
-        error("tick失敗: " + truncateForLog(tickError));
+    var tickError = "";
+    if (res.failedChunks > 0) {
+      // 失敗はチャンク単位で数える（158銘柄を80件ずつなら1ティックで最大2件増える）
+      tickErrorCount += res.failedChunks;
+      tickError = res.firstError;
+    } else {
+      // 全チャンクが例外なく返ったが、応答本文に立花のエラーが混ざっている場合の保険。
+      // この経路はティック単位でしか判定できないので1件として数える
+      tickError = tickErrorReason(rec);
+      if (tickError) tickErrorCount++;
+    }
+    if (tickError && tickErrorLogCount < TICK_ERROR_LOG_LIMIT) {
+      tickErrorLogCount++;
+      error("tick失敗: " + truncateForLog(tickError));
+    }
+
+    // 要求件数と応答件数の不一致。取得自体は成功しているので失敗カウンタには混ぜない。
+    // 84ティックぶんログが埋まるのを避けるため、詳細はセッション内で最初の1回だけ出す
+    if (res.mismatches.length > 0) {
+      mismatchTickCount++;
+      if (!mismatchLogged) {
+        mismatchLogged = true;
+        res.mismatches.forEach(function (m) {
+          var msg = "件数不一致 チャンク" + m.index + "/" + res.chunkCount +
+            " 要求" + m.requested + "件 / 応答" + m.received + "件";
+          if (m.missing.length) {
+            msg += " 欠落:" + m.missing.slice(0, MISMATCH_PREVIEW).join(",");
+            if (m.missing.length > MISMATCH_PREVIEW) {
+              msg += " ...他" + (m.missing.length - MISMATCH_PREVIEW) + "件";
+            }
+          }
+          warn(msg);
+        });
       }
     }
 
@@ -362,6 +496,8 @@ async function runSession() {
   } else {
     log("収集終了:", summary, elapsedSec);
   }
+  // 不一致は0件でも出す。「今日は取りこぼしが無かった」ことを毎朝確認できるようにするため
+  log("件数不一致 " + mismatchTickCount + "ティック");
 
   await postLog({
     date: date,
