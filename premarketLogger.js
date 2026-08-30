@@ -152,6 +152,11 @@ var TICK_INTERVAL_MS = 15 * 1000;    // 窓に入ったかを15秒ごとに見�
 var POST_TIMEOUT_MS = 30 * 1000;
 var POST_MAX_ATTEMPTS = 3;
 
+// 寄り前予想の生成要求のタイムアウト。生ログのPOSTと同じ30秒。
+// Vercel側は158銘柄ぶんの集計（summarizePremarketDate）と予想生成をまとめて
+// 1リクエストで行うため、通常のAPI呼び出しより長めに待つ必要がある。
+var PREDICTION_TIMEOUT_MS = 30 * 1000;
+
 // POSTサイズの警告閾値（KB）。
 // ・ペイロードは 19.58KB/銘柄（2026-08-24 実測: 100銘柄 = 1958KB）
 // ・PREMARKET_MAX=158（全件）でも約3.09MB（3168KB）で収まる見込み
@@ -396,6 +401,48 @@ async function postLog(payload) {
   return false;
 }
 
+// 生ログの保存が終わった直後に、その日ぶんの寄り前予想を作らせる。
+// 予想の計算そのものは Vercel 側（api/sync.js の premarket-prediction）にあり、
+// こちらは「作れ」と1回伝えるだけ。ボディは持たせず日付はクエリで渡す。
+//
+// ・直列で1回だけ。リトライはしない
+// ・失敗しても収集セッションの成否には影響させない（例外を外へ投げない）。
+// 　tickErrorCount にも errorCount にも数えない。あれは立花からの取得の失敗を
+// 　表す数字であって、Vercelへの後処理の失敗を混ぜると朝の取得状況が読めなくなる
+// ・失敗しても生ログ（premarket:log:<日付>）は既に保存済みなので、
+// 　あとから手動で同じURL（POST /api/sync?resource=premarket-prediction&date=<日付>）を
+// 　X-Relay-Secret 付きで叩けば同じ予想を作り直せる。復旧に再収集は要らない
+async function postPrediction(date) {
+  try {
+    var res = await fetch(
+      API_BASE + "/api/sync?resource=premarket-prediction&date=" + encodeURIComponent(date),
+      {
+        method: "POST",
+        headers: authHeaders(),
+        signal: AbortSignal.timeout(PREDICTION_TIMEOUT_MS),
+      }
+    );
+    if (res.status !== 200) {
+      var text = "";
+      try { text = await res.text(); } catch (e) { text = ""; }
+      warn("予想の生成に失敗しました（生ログは保存済みのため手動で再実行できます）: status=" +
+        res.status + " " + truncateForLog(text));
+      return;
+    }
+    // 応答は { ok, date, count, skipped }。count が生成できた銘柄数、
+    // skipped が買い比率不足・観測回数不足で見送った銘柄数
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    var count = (data && data.count != null) ? data.count : "?";
+    var skipped = (data && data.skipped != null) ? data.skipped : "?";
+    log("予想を生成しました:", date, count + "件（見送り" + skipped + "件）");
+  } catch (e) {
+    // タイムアウト・ネットワーク断・JSON以外の応答など、ここで全て握りつぶす
+    warn("予想の生成に失敗しました（生ログは保存済みのため手動で再実行できます）: " +
+      truncateForLog(errorMessage(e)));
+  }
+}
+
 // ── 当日ぶんの収集ループ ─────────────────────────────────────────────────
 var running = false;   // セッションの多重起動防止（tick用）
 var fetching = false;  // 1ティックの取得が進行中か（runSessionを直接呼ばれた場合の保険）
@@ -499,7 +546,7 @@ async function runSession() {
   // 不一致は0件でも出す。「今日は取りこぼしが無かった」ことを毎朝確認できるようにするため
   log("件数不一致 " + mismatchTickCount + "ティック");
 
-  await postLog({
+  var saved = await postLog({
     date: date,
     codes: CODES,
     cols: webapi.DEFAULT_COLS,
@@ -508,6 +555,10 @@ async function runSession() {
     count: records.length,
     records: records,
   });
+
+  // 生ログの保存が成功したときだけ予想を作らせる。
+  // 保存に失敗した日は Vercel 側に材料が無く、空振りの要求になるため呼ばない
+  if (saved) await postPrediction(date);
 }
 
 // ── 起動 ───────────────────────────────────────────────────────────────
