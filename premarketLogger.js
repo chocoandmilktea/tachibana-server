@@ -152,6 +152,17 @@ var TICK_INTERVAL_MS = 15 * 1000;    // 窓に入ったかを15秒ごとに見�
 var POST_TIMEOUT_MS = 30 * 1000;
 var POST_MAX_ATTEMPTS = 3;
 
+// 途中経過（暫定）を送る時刻。8:57 に達したら1セッションにつき1回だけ送る。
+// 端末側が気配サマリーを見に来るのは 8:45〜9:00 の間だが、本番の生ログが
+// Redis に書かれるのは収集ループを 9:06 に抜けた後の一括POSTなので、
+// 端末が見に来る時間帯には材料が1件も無く、毎朝必ず空振りしていた。
+// START_MINUTE / END_MINUTE とは役割が違う（収集窓そのものは一切変えない）。
+var PARTIAL_MINUTE = 8 * 60 + 57;
+
+// 途中経過POSTのタイムアウト。本番の POST_TIMEOUT_MS(30秒) より意図的に短くする。
+// 途中経過は次のティックの収集より優先度が低く、長く待つと取得間隔を押してしまうため。
+var PARTIAL_POST_TIMEOUT_MS = 10 * 1000;
+
 // 寄り前予想の生成要求のタイムアウト。生ログのPOSTと同じ30秒。
 // Vercel側は158銘柄ぶんの集計（summarizePremarketDate）と予想生成をまとめて
 // 1リクエストで行うため、通常のAPI呼び出しより長めに待つ必要がある。
@@ -401,6 +412,46 @@ async function postLog(payload) {
   return false;
 }
 
+// 途中経過（暫定）の保存。本番の postLog() とは別関数にしてある。
+// ・本文は postLog() と同じ7項目に partial:true を1つ足しただけ。
+// 　records はその時点の配列をそのまま送る（間引き・集計を一切しない）。
+// 　買い比率などの集計をこちら側で新たに実装すると集計が2箇所に分かれ、
+// 　9:00前と9:06以降で数字が食い違ったまま画面上は正常に見えることになる
+// ・Vercel側は partial:true を見て保存先を premarket:log:partial:<日付> へ切り替える
+// 　（追記ではなく上書き・TTL6時間）。本番キー premarket:log:<日付> には一切書かれない
+// ・リトライしない（試行1回のみ）。途中経過は失敗しても翌回で取り返せないが、
+// 　リトライで本番の収集を止めるほうが損害が大きい
+// ・例外を外へ投げない。失敗は warn を1行残すだけで、呼び出し元の収集ループはそのまま続く
+// ・サイズの閾値判定（logPayloadSize）は使わない。あちらは本番のPOSTを前提にした
+// 　文面と閾値であり、途中経過で流用するとログ上で本番と区別できなくなるため
+async function postPartialLog(payload) {
+  var body = JSON.stringify(payload);
+  var kb = Math.round(Buffer.byteLength(body, "utf8") / 1024);
+  var size = payload.count + "レコード / " + kb + "KB";
+  try {
+    var res = await fetch(API_BASE + "/api/sync?resource=premarket-log", {
+      method: "POST",
+      headers: authHeaders(),
+      body: body,
+      signal: AbortSignal.timeout(PARTIAL_POST_TIMEOUT_MS),
+    });
+    if (res.status === 200) {
+      log("途中経過を保存しました:", payload.date, size);
+      return true;
+    }
+    var text = "";
+    try { text = await res.text(); } catch (e) { text = ""; }
+    warn("途中経過の保存に失敗しました（収集は継続します）: " + size +
+      " status=" + res.status + " " + truncateForLog(text));
+    return false;
+  } catch (e) {
+    // タイムアウト・ネットワーク断など、ここで全て握りつぶす
+    warn("途中経過の保存に失敗しました（収集は継続します）: " + size +
+      " " + truncateForLog(errorMessage(e)));
+    return false;
+  }
+}
+
 // 生ログの保存が終わった直後に、その日ぶんの寄り前予想を作らせる。
 // 予想の計算そのものは Vercel 側（api/sync.js の premarket-prediction）にあり、
 // こちらは「作れ」と1回伝えるだけ。ボディは持たせず日付はクエリで渡す。
@@ -457,8 +508,19 @@ async function runSession() {
                              // 「先頭3ティックぶんだけ出す」という抑制はこちらで判定する
   var mismatchTickCount = 0; // 要求件数と応答件数が食い違ったティック数（失敗とは別枠）
   var mismatchLogged = false; // 不一致の詳細ログはセッション内で最初の1回だけ出す
+  // 途中経過を送ったか。runSession() のローカル変数なので、セッションごとに
+  // 必ず false から始まる（＝翌営業日は何もしなくても再び1回だけ送れる）
+  var partialPosted = false;
 
   log("開始:", date, "対象:", CODES.join(","), "カラム:", webapi.DEFAULT_COLS);
+
+  // 収集開始が既に8:57を過ぎている場合（起動が遅れた朝など）は途中経過を送らない。
+  // その時点で9:00が近く、端末が見に来る時間帯をほぼ過ぎていて意味が薄いため。
+  // 送信済みと同じ扱いにして、以降の判定をフラグ1つに寄せる
+  if (jstMinuteOfDay(nowJst()) >= PARTIAL_MINUTE) {
+    partialPosted = true;
+    log("開始時点で8:57を過ぎているため、途中経過の送信は行いません");
+  }
 
   while (true) {
     var d = nowJst();
@@ -531,6 +593,27 @@ async function runSession() {
     // 取得にかかった時間ぶん差し引いて、15秒間隔を保つ
     var wait = FETCH_INTERVAL_MS - elapsed;
     await sleep(wait > 0 ? wait : 0);
+
+    // 途中経過の送信。8:57に「達したら」1セッションにつき1回だけ。
+    // 等号一致（=== PARTIAL_MINUTE）にしないのは、ティックがずれて8:57ちょうどの
+    // 分を踏まなかった朝に一度も送られなくなるため。
+    // 上の待機より後に置いているのは、ティックの所要時間ログと15秒間隔の計算に
+    // 途中経過のPOST時間を混ぜないため（この1回だけ次のティックが最大10秒遅れる）。
+    // postPartialLog() は例外を外へ出さないので、失敗しても while ループは
+    // そのまま次の周回へ進み、本番の収集と9:06の一括POSTには影響しない
+    if (!partialPosted && jstMinuteOfDay(nowJst()) >= PARTIAL_MINUTE) {
+      partialPosted = true; // 成否によらず先に立てる（再送はしない）
+      await postPartialLog({
+        date: date,
+        codes: CODES,
+        cols: webapi.DEFAULT_COLS,
+        startedAt: startedAt,
+        finishedAt: Date.now(),
+        count: records.length,
+        records: records,
+        partial: true,
+      });
+    }
   }
 
   var errorCount = records.filter(function (r) { return r.error; }).length;
