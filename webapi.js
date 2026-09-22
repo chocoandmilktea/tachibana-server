@@ -147,11 +147,6 @@ async function getRankingMaster() {
   return stocks;
 }
 
-// /market-price（寄り前の板・気配の実測用）のデフォルトカラム。
-// ※これらが全て有効かは未確認。無効なカラムが混ざると立花がエラーを返すため、
-// 　cols クエリで個別に試せるようにしてある。
-var DEFAULT_COLS = "pDPP,pPRP,pDV,pDOP,pDHP,pDLP,pQAS,pQBS,pAAV,pABV,pGAP1,pGBP1,pGAV1,pGBV1,pQOV,pQUV";
-
 // columns 省略時は従来どおり "pDPP,pPRP,pDV"（ランキング用）
 async function fetchBatchPrice(session, codes, columns) {
   var ans = await auth.request(session.sUrlPrice, {
@@ -286,26 +281,6 @@ function start() {
       return;
     }
 
-    // 寄り前に板・気配が取れるかの実測用。キャッシュは一切かけず（秒単位の変化を見たいため）、
-    // 立花の戻り値 aCLMMfdsMarketPrice を加工せずそのまま返す
-    if (parsed.pathname === "/market-price" && req.method === "GET") {
-      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
-      var mpCode = parsed.searchParams.get("code");
-      if (!mpCode) return sendJson(res, 400, { error: "code required" });
-      var mpCols = parsed.searchParams.get("cols") || DEFAULT_COLS;
-      auth.ensureSession()
-        .then(function (session) {
-          return fetchBatchPrice(session, String(mpCode).split(","), mpCols);
-        })
-        .then(function (rows) { sendJson(res, 200, { cols: mpCols, rows: rows }); })
-        .catch(function (e) {
-          log("market-price取得エラー:", e.message);
-          // 立花のエラー内容も握りつぶさずそのまま返す（有効カラムの切り分けに使う）
-          sendJson(res, 500, { error: e.message, raw: e.answer || null });
-        });
-      return;
-    }
-
     if (parsed.pathname === "/ranking-data" && req.method === "GET") {
       if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
       getRankingData()
@@ -336,6 +311,6 @@ function start() {
   });
 }
 
-// fetchBatchPrice / DEFAULT_COLS は premarketLogger.js から直接使う
-// （常駐サーバー内から自分自身をHTTPで叩かずに済ませるため）
-module.exports = { start: start, fetchBatchPrice: fetchBatchPrice, DEFAULT_COLS: DEFAULT_COLS };
+// fetchBatchPrice は現状このファイル内（getRankingData）からのみ使う。
+// 常駐サーバー内の他モジュールが自分自身をHTTPで叩かずに済むよう export は残す
+module.exports = { start: start, fetchBatchPrice: fetchBatchPrice };
