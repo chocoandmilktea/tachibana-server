@@ -1,5 +1,5 @@
-// 立花証券 e支店API v4r9 ログイン処理
-// 参考: 立花証券公式サンプル e_api_sample_v4r9.py の CLMAuthLoginRequest 部分を
+// 立花証券 e支店API v4r10 ログイン処理
+// 参考: 立花証券公式サンプル e_api_sample_v4r10.py の CLMAuthLoginRequest 部分を
 //       Node.js に移植したもの。仕様の詳細は公式マニュアルを参照してください。
 
 var crypto = require("crypto");

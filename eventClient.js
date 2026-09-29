@@ -3,7 +3,7 @@
 //
 // 注意: p_board_no / p_gyou_no / p_evt_cmd の詳細な意味は公式マニュアルの
 // 「EVENT I/F 利用方法、データ仕様」に記載されています。ここでは公式サンプル
-// (e_api_sample_v4r9.py) と同じデフォルト値を踏襲していますが、実際に届く
+// (e_api_sample_v4r10.py) と同じデフォルト値を踏襲していますが、実際に届く
 // データを見ながら調整してください（onData に生データも渡しています）。
 
 var WebSocket = require("ws");
