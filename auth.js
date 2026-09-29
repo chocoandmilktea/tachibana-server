@@ -258,7 +258,42 @@ function decryptUrl(encryptedB64) {
   return decrypted.toString("ascii").replace(/[\r\n]+$/, "");
 }
 
-async function login() {
+// ── ログイン失敗時の待ち時間（バックオフ） ─────────────────────────────
+// ログインが失敗し続けると、呼び出し側のループ（watcherは3秒おき）に合わせて
+// 立花へ問い合わせ続けてしまう（2026-09-29に20分で約800回失敗した）。
+// 立花は負荷の大きい利用者に個別連絡すると明記しているため、失敗が続いたら
+// 5秒→10秒→20秒…と待ち時間を倍にし（上限5分）、その間は問い合わせずに即エラーにする。
+var LOGIN_BACKOFF_BASE_MS = 5 * 1000;
+var LOGIN_BACKOFF_MAX_MS = 5 * 60 * 1000;
+var loginFailCount = 0; // ログインの連続失敗回数
+var loginNextAllowedAt = 0; // 次にログインを試してよい時刻(epoch ms)
+var loginInFlight = null; // 実行中のログイン。同時に呼ばれたら新しく問い合わせず結果を共有する
+
+function login() {
+  if (loginInFlight) return loginInFlight;
+  var waitMs = loginNextAllowedAt - Date.now();
+  if (waitMs > 0) {
+    // 待ち時間中はログを出さない（呼び出しのたびに出すとログが埋まるため）
+    return Promise.reject(new Error("ログイン失敗が続いているため待機中です（あと" + Math.ceil(waitMs / 1000) + "秒）"));
+  }
+  loginInFlight = loginOnce().then(
+    function () {
+      loginFailCount = 0;
+      loginNextAllowedAt = 0;
+    },
+    function (e) {
+      loginFailCount += 1;
+      var delayMs = Math.min(LOGIN_BACKOFF_BASE_MS * Math.pow(2, loginFailCount - 1), LOGIN_BACKOFF_MAX_MS);
+      loginNextAllowedAt = Date.now() + delayMs;
+      console.log("[auth] ログイン失敗 " + loginFailCount + "回連続。次の試行は" + Math.round(delayMs / 1000) + "秒後");
+      throw e;
+    }
+  ).finally(function () { loginInFlight = null; });
+  return loginInFlight;
+}
+
+// 立花へ実際にログインを問い合わせる（1回分）。呼び出しは login() 経由に限る
+async function loginOnce() {
   var ans = await request(config.urlAuth, {
     sCLMID: "CLMAuthLoginRequest",
     sAuthId: config.authId,
