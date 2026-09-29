@@ -32,17 +32,24 @@ var topixInflight = null;
 async function fetchTopixChange() {
   var session = await auth.ensureSession();
 
-  // 指数マスタからTOPIXの銘柄コードを検索（verify-topix.jsで確認済みの方式）
+  // 指数銘柄マスタ（v4r10のCLMStkGetIssueMstIndex）からTOPIXの銘柄コードを検索する。
+  // 探し方は従来どおり「銘柄名にTOPIXを含む最初の行」
   var masterAns = await auth.request(session.sUrlMaster, {
-    sCLMID: "CLMMfdsGetMasterData",
-    sTargetCLMID: "CLMIssueMstIndex",
+    sCLMID: "CLMStkGetIssueMstIndex",
   });
   auth.checkAnswer(masterAns);
-  var list = masterAns.CLMIssueMstIndex || [];
+  if (!Array.isArray(masterAns.aCLMStkIssueMstIndex)) {
+    throw new Error("指数銘柄マスタの応答に aCLMStkIssueMstIndex がありません");
+  }
+  var list = masterAns.aCLMStkIssueMstIndex;
   var topixItem = list.filter(function (item) {
     return String(item.sIssueName || "").indexOf("TOPIX") !== -1;
   })[0];
-  if (!topixItem) throw new Error("TOPIX銘柄が指数マスタに見つかりません");
+  if (!topixItem) {
+    log("TOPIX銘柄が指数銘柄マスタに見つかりません（全", list.length, "件）");
+    throw new Error("TOPIX銘柄が指数マスタに見つかりません");
+  }
+  log("TOPIX銘柄コード:", topixItem.sIssueCode);
 
   var histAns = await auth.request(session.sUrlPrice, {
     sCLMID: "CLMMfdsGetMarketPriceHistory",
@@ -113,11 +120,94 @@ async function getIssueDetail(code) {
   return data;
 }
 
+// ── 株式銘柄マスタ（v4r10のCLMStkGetIssueMstKabu）。24時間キャッシュ ──────────
+// ランキング用（getRankingMaster）と銘柄名用（getNameMaster）の両方がこの結果を使う。
+// 全銘柄分を1回で返すため応答が大きく、既定の10秒では足りない恐れがあるので30秒にする。
+var kabuMasterCache = { ts: 0, list: null };
+var KABU_MASTER_TTL = 24 * 60 * 60 * 1000;
+var KABU_MASTER_TIMEOUT_MS = 30 * 1000;
+// /ranking-data と /names が同時に来ても重い問い合わせを1回にまとめる（TOPIXと同じ方式）
+var kabuMasterInflight = null;
+
+async function fetchKabuMaster() {
+  var session = await auth.ensureSession();
+  var startedAt = Date.now();
+  var ans = await auth.request(session.sUrlMaster, {
+    sCLMID: "CLMStkGetIssueMstKabu",
+  }, KABU_MASTER_TIMEOUT_MS);
+  auth.checkAnswer(ans);
+  // 空の一覧を「成功」として返すと、Vercel側がRedisに残している前回の正常なデータを
+  // 空で上書きしてしまう。配列が無い・0件のときはエラーにし、キャッシュにも保存しない
+  if (!Array.isArray(ans.aCLMStkIssueMstKabu)) {
+    throw new Error("銘柄マスタの応答に aCLMStkIssueMstKabu がありません");
+  }
+  var list = ans.aCLMStkIssueMstKabu;
+  if (list.length === 0) throw new Error("銘柄マスタの取得結果が0件です");
+
+  kabuMasterCache = { ts: Date.now(), list: list };
+  log("銘柄マスタ取得", list.length + "件", ((Date.now() - startedAt) / 1000).toFixed(1) + "秒");
+  return list;
+}
+
+async function getKabuMaster() {
+  if (kabuMasterCache.list && Date.now() - kabuMasterCache.ts < KABU_MASTER_TTL) return kabuMasterCache.list;
+  if (kabuMasterInflight) return kabuMasterInflight;
+  // 成功・失敗どちらでも必ずnullに戻す（失敗時に永久に同じ失敗Promiseを返さないため）
+  kabuMasterInflight = fetchKabuMaster().finally(function () {
+    kabuMasterInflight = null;
+  });
+  return kabuMasterInflight;
+}
+
+// ── 業種コード→業種名。v4r10の銘柄マスタは業種名を返さないため、ここで変換する ──
+// アプリ側（daytrade-simulator）の業種絞り込みと1文字でも違うと一致しなくなるので、
+// 表記（全角の「・」、証券の区切りの全角「、」）を変えないこと。
+// 表に無いコード（9999:その他 など）は null 扱い
+var GYOUSYU_NAMES = {
+  "0050": "水産・農林業",
+  "1050": "鉱業",
+  "2050": "建設業",
+  "3050": "食料品",
+  "3100": "繊維製品",
+  "3150": "パルプ・紙",
+  "3200": "化学",
+  "3250": "医薬品",
+  "3300": "石油・石炭製品",
+  "3350": "ゴム製品",
+  "3400": "ガラス・土石製品",
+  "3450": "鉄鋼",
+  "3500": "非鉄金属",
+  "3550": "金属製品",
+  "3600": "機械",
+  "3650": "電気機器",
+  "3700": "輸送用機器",
+  "3750": "精密機器",
+  "3800": "その他製品",
+  "4050": "電気・ガス業",
+  "5050": "陸運業",
+  "5100": "海運業",
+  "5150": "空運業",
+  "5200": "倉庫・運輸関連業",
+  "5250": "情報・通信業",
+  "6050": "卸売業",
+  "6100": "小売業",
+  "7050": "銀行業",
+  "7100": "証券、商品先物取引業",
+  "7150": "保険業",
+  "7200": "その他金融業",
+  "8050": "不動産業",
+  "9050": "サービス業",
+};
+
+function gyousyuNameOf(code) {
+  return Object.prototype.hasOwnProperty.call(GYOUSYU_NAMES, code) ? GYOUSYU_NAMES[code] : null;
+}
+
 // ── ランキング用データ(出来高・現在値・名前・業種)。全銘柄まとめて返す ────────
-// 銘柄マスタは24時間キャッシュ（滅多に変わらないため）、
+// 銘柄マスタは24時間キャッシュ（getKabuMaster側）、
 // 出来高・現在値は3分キャッシュ（頻繁に呼ばれても毎回立花証券に問い合わせずに済むように）
-var rankingMasterCache = { ts: 0, list: null };
-var RANKING_MASTER_TTL = 24 * 60 * 60 * 1000;
+// rankingMasterCache は「どの銘柄マスタから絞り込んだか」を src で覚え、マスタが更新された時だけ作り直す
+var rankingMasterCache = { src: null, list: null };
 var rankingDataCache = { ts: 0, rows: null };
 var RANKING_DATA_TTL = 3 * 60 * 1000;
 
@@ -128,21 +218,13 @@ function chunk(arr, size) {
 }
 
 async function getRankingMaster() {
-  var now = Date.now();
-  if (rankingMasterCache.list && now - rankingMasterCache.ts < RANKING_MASTER_TTL) return rankingMasterCache.list;
+  var all = await getKabuMaster();
+  if (rankingMasterCache.src === all) return rankingMasterCache.list;
 
-  var session = await auth.ensureSession();
-  var ans = await auth.request(session.sUrlMaster, {
-    sCLMID: "CLMMfdsGetMasterData",
-    sTargetCLMID: "CLMIssueMstKabu",
-    sTargetColumn: "sIssueCode,sIssueName,sGyousyuCode,sGyousyuName",
-  });
-  auth.checkAnswer(ans);
-  var all = ans.CLMIssueMstKabu || [];
   // 業種コード9999(その他)はETF/REIT/投信等が多いため除外し、実株式のみに絞り込む
   var stocks = all.filter(function (i) { return i.sGyousyuCode !== "9999"; });
 
-  rankingMasterCache = { ts: now, list: stocks };
+  rankingMasterCache = { src: all, list: stocks };
   log("銘柄マスタ更新:", stocks.length, "件（全", all.length, "件中）");
   return stocks;
 }
@@ -172,7 +254,7 @@ async function getRankingData() {
   var nameMap = {}, sectorMap = {};
   master.forEach(function (i) {
     nameMap[i.sIssueCode] = i.sIssueName;
-    sectorMap[i.sIssueCode] = i.sGyousyuName;
+    sectorMap[i.sIssueCode] = gyousyuNameOf(i.sGyousyuCode);
   });
 
   var session = await auth.ensureSession();
@@ -191,6 +273,11 @@ async function getRankingData() {
         log("バッチ取得エラー:", r.reason.message);
       }
     });
+  }
+  // 全バッチが失敗・空だった場合は、空の一覧を成功扱いで返さない（キャッシュにも保存しない）。
+  // Vercel側がRedisに残している前回の正常なデータを空で上書きさせないため
+  if (Object.keys(priceMap).length === 0) {
+    throw new Error("株価の取得結果が全銘柄とも0件です（対象 " + codes.length + " 銘柄）");
   }
 
   var rows = codes.map(function (code) {
@@ -217,29 +304,20 @@ async function getRankingData() {
   return rows;
 }
 
-// ── 銘柄名マスタ(コード→会社名)。ipo.js(/api/ipo)の代替用。24時間キャッシュ ──
-var nameMasterCache = { ts: 0, names: null };
-var NAME_MASTER_TTL = 24 * 60 * 60 * 1000;
+// ── 銘柄名マスタ(コード→会社名)。ipo.js(/api/ipo)の代替用。24時間キャッシュ（getKabuMaster側） ──
+// nameMasterCache は rankingMasterCache と同じく、元にした銘柄マスタを src で覚える
+var nameMasterCache = { src: null, names: null };
 
 async function getNameMaster() {
-  var now = Date.now();
-  if (nameMasterCache.names && now - nameMasterCache.ts < NAME_MASTER_TTL) return nameMasterCache.names;
-
-  var session = await auth.ensureSession();
-  var ans = await auth.request(session.sUrlMaster, {
-    sCLMID: "CLMMfdsGetMasterData",
-    sTargetCLMID: "CLMIssueMstKabu",
-    sTargetColumn: "sIssueCode,sIssueName",
-  });
-  auth.checkAnswer(ans);
-  var list = ans.CLMIssueMstKabu || [];
+  var list = await getKabuMaster();
+  if (nameMasterCache.src === list) return nameMasterCache.names;
 
   var names = {};
   list.forEach(function (i) {
     if (i.sIssueCode && i.sIssueName) names[i.sIssueCode] = i.sIssueName;
   });
 
-  nameMasterCache = { ts: now, names: names };
+  nameMasterCache = { src: list, names: names };
   log("銘柄名マスタ更新:", Object.keys(names).length, "件");
   return names;
 }
