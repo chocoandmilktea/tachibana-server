@@ -107,21 +107,23 @@ async function checkWatchAndSubscribe() {
     if (ageSeconds <= config.watchStaleSeconds) desiredTicker = watch.ticker;
   }
 
-  var client = await getOrCreateEventClient().catch(function (e) {
-    log("ログイン/セッション取得に失敗:", e.message);
-    return null;
-  });
-  if (!client) return;
-
+  // 見ている銘柄が無いときは接続を作らない（接続を作るとログインが走るため）。
+  // 既存の接続が購読中なら止めるだけにする
   if (desiredTicker === null) {
-    if (client.currentTicker !== null) {
+    if (eventClient && eventClient.currentTicker !== null) {
       log("監視終了（一定時間、誰も見ていません）");
-      client.stop();
+      eventClient.stop();
       latestFields = null;
       latestTicker = null;
     }
     return;
   }
+
+  var client = await getOrCreateEventClient().catch(function (e) {
+    log("ログイン/セッション取得に失敗:", e.message);
+    return null;
+  });
+  if (!client) return;
 
   if (client.currentTicker !== desiredTicker) {
     log("監視銘柄を切り替え:", client.currentTicker, "→", desiredTicker);
@@ -149,10 +151,18 @@ async function flushToRedisIfDirty() {
   }
 }
 
+// 前回の checkWatchAndSubscribe が終わっていない間は次の回を始めない。
+// ログインや Vercel API の応答が遅いと、重なった回がそれぞれログインを試してしまうため
+var checkRunning = false;
+
 function start() {
   log("起動しました。ポーリング間隔:", config.watchPollIntervalSeconds, "秒 / 書き込み間隔:", config.quoteWriteMinIntervalSeconds, "秒");
   setInterval(function () {
-    checkWatchAndSubscribe().catch(function (e) { log("予期しないエラー:", e.message); });
+    if (checkRunning) return;
+    checkRunning = true;
+    checkWatchAndSubscribe()
+      .catch(function (e) { log("予期しないエラー:", e.message); })
+      .finally(function () { checkRunning = false; });
   }, config.watchPollIntervalSeconds * 1000);
 
   setInterval(function () {

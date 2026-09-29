@@ -78,17 +78,10 @@ EVENT I/Fは変化した項目だけを送ってくるため、受信データ�
 | `webapi.js` | HTTPサーバーの本体（上記） |
 | `scanner.js` | 定時自動スキャンのスケジューラ（上記） |
 | `holidays.js` | 日本市場の休場日判定（土日・祝日・振替休日・年末年始）。外部APIには問い合わせない |
-| `verify-topix.js` | 検証用スクリプト。TOPIXが立花APIで代用できるかを確認する |
-| `verify-tachibana-migration.js` | 検証用スクリプト。銘柄マスタ・銘柄詳細・日足・時価情報が取れるかを確認する |
-| `verify-tachibana-ranking.js` | 検証用スクリプト。ランキング用データの絞り込み条件と一括取得の所要時間を計測する |
 | `package.json` | 依存（`dotenv` / `iconv-lite` / `node-cron` / `ws`）と起動コマンド。Node.js 18以上 |
 | `railway.json` | Railwayのビルド・起動設定（NIXPACKS / `node index.js` / 失敗時に最大10回再起動） |
 | `.gitignore` | `node_modules/` と `.env` 系・ログを除外 |
 | `README.md` | このファイル |
-
-`verify-*.js` は通常運用では動きません。使う場合は `railway.json` の `startCommand` を一時的に
-`node verify-xxx.js` へ変えてデプロイし、確認後に必ず `node index.js` へ戻してください
-（戻さないと常駐処理が動かないままになります）。
 
 ## 環境変数
 
