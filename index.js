@@ -9,3 +9,4 @@ process.on("unhandledRejection", function (err) {
 watcher.start();
 webapi.start();
 scanner.start();
+require("./bookLogger").start();

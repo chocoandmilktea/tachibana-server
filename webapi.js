@@ -389,6 +389,6 @@ function start() {
   });
 }
 
-// fetchBatchPrice は現状このファイル内（getRankingData）からのみ使う。
-// 常駐サーバー内の他モジュールが自分自身をHTTPで叩かずに済むよう export は残す
-module.exports = { start: start, fetchBatchPrice: fetchBatchPrice };
+// fetchBatchPrice / getRankingMaster は bookLogger.js からも直接使う
+// （常駐サーバー内の他モジュールが自分自身をHTTPで叩かずに済ませるため）
+module.exports = { start: start, fetchBatchPrice: fetchBatchPrice, getRankingMaster: getRankingMaster };
