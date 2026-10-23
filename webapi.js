@@ -304,6 +304,82 @@ async function getRankingData() {
   return rows;
 }
 
+// ── 複数銘柄の現在値・約定時刻・前日終値・始値・当日安値（/quotes）。キャッシュなし ──
+// アプリの銘柄一覧で場中の状態を立花のリアルタイム値で計算するために使う。
+// 古い値を今の値として計算させないため、控え値・キャッシュは持たず、1回でも失敗したら全体を失敗にする
+var QUOTES_MAX_CODES = 300;
+// 立花の時価情報は1要求につき先頭120件までしか返さず、121件目以降は黙って捨てられるため100件ずつに割る
+var QUOTES_CHUNK_SIZE = 100;
+var QUOTES_COLUMNS = "pDPP,tDPP:T,pPRP,pDOP,pDLP";
+
+// 取引前など値が無い項目は空文字で返る。空・0 は null にそろえる
+function numOrNull(v) {
+  if (v == null || String(v).trim() === "") return null;
+  var n = parseFloat(v);
+  return isFinite(n) && n !== 0 ? n : null;
+}
+
+function textOrNull(v) {
+  var s = v == null ? "" : String(v).trim();
+  return s === "" || s === "0" ? null : s;
+}
+
+// 日本時間の日時（例: 2026-10-23T09:15:02+09:00）。Railwayのサーバー時刻はUTCのため+9時間して読む
+function jstIso(ms) {
+  return new Date(ms + 9 * 60 * 60 * 1000).toISOString().slice(0, 19) + "+09:00";
+}
+
+function normCode(v) {
+  return String(v == null ? "" : v).trim().toUpperCase();
+}
+
+// "7203,6758,7203" → ["7203","6758"]。形式は /issue-detail と同じく .T を付けない銘柄コード
+function parseCodes(text) {
+  var seen = {};
+  var out = [];
+  String(text || "").split(",").forEach(function (c) {
+    var code = normCode(c);
+    if (!code || seen[code]) return;
+    seen[code] = true;
+    out.push(code);
+  });
+  return out;
+}
+
+async function getQuotes(codes) {
+  var fetchedAt = jstIso(Date.now());
+  var rowMap = {};
+  var groups = chunk(codes, QUOTES_CHUNK_SIZE);
+  // 同時にではなく1つずつ順に問い合わせる。失敗はそのまま投げて全体を失敗にする
+  for (var i = 0; i < groups.length; i++) {
+    // auth.request が再ログインすると仮想URLが変わるため、セッションは毎回取り直す
+    var session = await auth.ensureSession();
+    var rows = await fetchBatchPrice(session, groups[i], QUOTES_COLUMNS);
+    rows.forEach(function (r) { if (r) rowMap[normCode(r.sIssueCode)] = r; });
+  }
+
+  var quotes = [];
+  var missing = [];
+  codes.forEach(function (code) {
+    var r = rowMap[code];
+    var q = r ? {
+      code: code,
+      price: numOrNull(r.pDPP),
+      time: textOrNull(r["tDPP:T"]),
+      prevClose: numOrNull(r.pPRP),
+      open: numOrNull(r.pDOP),
+      low: numOrNull(r.pDLP),
+    } : null;
+    // 応答に行が無い、または5項目とも空の銘柄は「値が返らなかった」扱い
+    if (!q || (q.price == null && q.time == null && q.prevClose == null && q.open == null && q.low == null)) {
+      missing.push(code);
+      return;
+    }
+    quotes.push(q);
+  });
+  return { fetchedAt: fetchedAt, quotes: quotes, missing: missing };
+}
+
 // ── 銘柄名マスタ(コード→会社名)。ipo.js(/api/ipo)の代替用。24時間キャッシュ（getKabuMaster側） ──
 // nameMasterCache は rankingMasterCache と同じく、元にした銘柄マスタを src で覚える
 var nameMasterCache = { src: null, names: null };
@@ -355,6 +431,22 @@ function start() {
         .catch(function (e) {
           log("銘柄詳細取得エラー:", e.message);
           sendJson(res, 500, { error: e.message });
+        });
+      return;
+    }
+
+    if (parsed.pathname === "/quotes" && req.method === "GET") {
+      if (!checkSecret(req)) return sendJson(res, 401, { error: "unauthorized" });
+      var codes = parseCodes(parsed.searchParams.get("codes"));
+      if (!codes.length) return sendJson(res, 400, { error: "codes required" });
+      if (codes.length > QUOTES_MAX_CODES) {
+        return sendJson(res, 400, { error: "too many codes: " + codes.length + " (max " + QUOTES_MAX_CODES + ")" });
+      }
+      getQuotes(codes)
+        .then(function (data) { sendJson(res, 200, data); })
+        .catch(function (e) {
+          log("複数銘柄の時価取得エラー:", e.message);
+          sendJson(res, 502, { error: e.message });
         });
       return;
     }
