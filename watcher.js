@@ -5,11 +5,14 @@
 //    （フロントはこのRedisの値をポーリングして表示する）
 // 4. しばらく誰も見ていない場合は接続を切ってAPI負荷を抑える
 // 5. 毎日8:35（メンテナンス明け）に自動で再ログインし、接続を張り直す
-// 6. セッション切れ等のエラー応答を受け取ったら、その場で再ログインして張り直す
+// 6. セッション切れ(p_errno=2)の応答を受け取ったら、その場で再ログインして張り直す
+//    （それ以外のエラー番号ではログインせず、接続を切って倍々の待ち時間で再接続するだけ）
+// 7. 休場日・営業日の3:00〜8:35は接続を作らず、既存の接続も止める（accessGate.js）
 
 var auth = require("./auth");
 var relay = require("./relay");
 var config = require("./config");
+var accessGate = require("./accessGate");
 var TachibanaEventClient = require("./eventClient");
 
 var eventClient = null;
@@ -39,30 +42,60 @@ function resetEventClient() {
   latestTicker = null;
 }
 
-// セッション切れ等のエラー応答を受け取った時の復旧処理
-async function handleSessionError(evt) {
+// エラー応答を受け取った時の復旧処理。client はそのエラーを受け取った接続
+// 以前は p_errno が0以外なら何でもセッション切れとみなし、30秒おきに再ログインしうる作りだった。
+// 閉局・メンテナンスを表す番号は分かっていないため、ログインするのは p_errno=2 のときだけにする
+async function handleSessionError(evt, client) {
+  if (client !== eventClient) return; // 既に作り直した古い接続からの通知は無視する
+  var errno = String(evt.fields.p_errno);
+  var detail = "p_errno=" + errno + " " + (evt.fields.p_err || "");
+
+  if (errno !== "2") {
+    // ログインはせず接続だけ切る。再接続は eventClient の待ち時間（3秒から倍々・最大5分）に任せる
+    log("エラー応答を受信（" + detail + "）。セッション切れではないため再ログインせず、接続を切ります。");
+    client.dropConnection();
+    return;
+  }
+
+  // この接続を作った後に、別の経路（webapi の再ログインなど）で新しいセッションが取れていれば
+  // ログインせず、新しいセッションで接続を作り直すだけでよい
+  if (auth.getLoadedAt() > client.sessionLoadedAt) {
+    log("セッション切れを受信（" + detail + "）。新しいセッションが既にあるため、ログインせず接続を作り直します。");
+    resetEventClient();
+    return;
+  }
+
   var now = Date.now();
-  if (now - lastForcedReLoginAt < FORCED_RELOGIN_MIN_INTERVAL_MS) return;
+  if (now - lastForcedReLoginAt < FORCED_RELOGIN_MIN_INTERVAL_MS) {
+    client.dropConnection(); // 再ログインは見送り、倍々の待ち時間で再接続させる
+    return;
+  }
   lastForcedReLoginAt = now;
 
-  log("セッションエラーを検知（p_errno=" + evt.fields.p_errno + " " + (evt.fields.p_err || "") + "）。再ログインします。");
+  log("セッション切れを受信（" + detail + "）。再ログインします。");
   try {
     await auth.reLogin();
     log("再ログインに成功しました。接続を張り直します。");
+    resetEventClient();
   } catch (e) {
+    // accessGate が止めた場合の理由は accessGate が切り替わり時にログに出している
     log("再ログインに失敗:", e.message);
+    // 同じ（切れた）セッションで作り直しても失敗するだけなので、倍々の待ち時間で再接続させる
+    if (client === eventClient) client.dropConnection();
   }
-  resetEventClient();
 }
 
 async function getOrCreateEventClient() {
   var session = await auth.ensureSession();
   if (!eventClient) {
-    eventClient = new TachibanaEventClient(session.sUrlEventWebSocket, config.mktCode);
+    var client = new TachibanaEventClient(session.sUrlEventWebSocket, config.mktCode);
+    // どのセッションで作った接続かを覚えておく（p_errno=2 のとき、新しいセッションが既にあるかを見る）
+    client.sessionLoadedAt = auth.getLoadedAt();
+    eventClient = client;
     eventClient.on("open", function (ticker) { log("接続開始:", ticker); });
     eventClient.on("error", function (err) { log("WebSocketエラー:", err.message); });
     eventClient.on("sessionError", function (evt) {
-      handleSessionError(evt).catch(function (e) { log("復旧処理エラー:", e.message); });
+      handleSessionError(evt, client).catch(function (e) { log("復旧処理エラー:", e.message); });
     });
     eventClient.on("data", function (evt) {
       // EVENT I/Fは差分（変化した項目だけ）を送ってくるため、丸ごと置き換えると
@@ -85,12 +118,26 @@ async function getOrCreateEventClient() {
 async function checkWatchAndSubscribe() {
   // メンテナンス明け(8:35)の日次再ログインが必要なら実施し、接続を張り直す
   var refreshed = await auth.refreshIfNeeded().catch(function (e) {
-    log("日次の再ログインに失敗:", e.message);
+    // 送信を止めた場合は3秒おきに同じログが出るので出さない（理由は accessGate が切り替わり時に出す）
+    if (!e.blocked) log("日次の再ログインに失敗:", e.message);
     return false;
   });
   if (refreshed) {
     log("日次の再ログインを実行しました。接続を張り直します。");
     resetEventClient();
+  }
+
+  // 休場日・営業日の3:00〜8:35は接続を作らず、張ったままの接続も止める（立花が閉まっている間に
+  // 接続を持ち続けない・ログインを試みないため）。一時停止中は新しく接続しないだけで、既存の接続は残す
+  var blocked = accessGate.check(Date.now());
+  if (blocked && blocked.reason !== "paused") {
+    if (eventClient && eventClient.currentTicker !== null) {
+      log("立花が閉まっている時間のため接続を止めます");
+      eventClient.stop();
+      latestFields = null;
+      latestTicker = null;
+    }
+    return;
   }
 
   var watch = null;
@@ -120,7 +167,7 @@ async function checkWatchAndSubscribe() {
   }
 
   var client = await getOrCreateEventClient().catch(function (e) {
-    log("ログイン/セッション取得に失敗:", e.message);
+    if (!e.blocked) log("ログイン/セッション取得に失敗:", e.message);
     return null;
   });
   if (!client) return;

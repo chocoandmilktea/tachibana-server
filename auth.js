@@ -7,6 +7,7 @@ var fs = require("fs");
 var path = require("path");
 var iconv = require("iconv-lite");
 var config = require("./config");
+var accessGate = require("./accessGate");
 
 var SESSION_FILE = path.join(__dirname, "session.json"); // 当日分のセッションを保存
 
@@ -100,8 +101,20 @@ function sleep(ms) {
 function postSerialized(url, paramsObj, gapMs, timeoutMs) {
   // gate は「採番 → 送信開始 → 次の採番までの間隔」まで待つPromise
   var gate = sendChain.then(function () {
+    // 立花へ送ってよいかを、通番を採番する前に判定する（止めるときは p_no を進めない）。
+    // 列に並んだ時点ではなく送る直前に判定するのは、並んでいる間に一時停止が始まった分も止めるため
+    var now = Date.now();
+    var isLogin = paramsObj.sCLMID === "CLMAuthLoginRequest";
+    var blocked = accessGate.check(now) || (isLogin ? accessGate.checkLogin(now) : null);
+    if (blocked) throw accessGate.blockedError(blocked);
+    if (isLogin) accessGate.recordLoginSent(now); // 成功・失敗にかかわらず送った回数として数える
+
     var params = Object.assign(nextHeader(), paramsObj);
-    var resPromise = postToServer(url, params, timeoutMs); // ここで送信が始まる
+    // ここで送信が始まる。結果（成功・失敗）は一時停止の判定のため accessGate に記録する
+    var resPromise = postToServer(url, params, timeoutMs).then(
+      function (ans) { accessGate.recordAnswer(ans); return ans; },
+      function (e) { accessGate.recordFailure(e && e.message); throw e; }
+    );
     resPromise.catch(function () {}); // 応答は下段で待つので、未処理拒否の警告だけ防ぐ
     return sleep(gapMs).then(function () {
       // 応答Promiseはオブジェクトに包む（thenで自動的に待たれてしまうのを防ぐため）
@@ -282,6 +295,8 @@ function login() {
       loginNextAllowedAt = 0;
     },
     function (e) {
+      // accessGate が送信を止めた場合は立花へ送っていないので、失敗回数（待ち時間）に数えない
+      if (e && e.blocked) throw e;
       loginFailCount += 1;
       var delayMs = Math.min(LOGIN_BACKOFF_BASE_MS * Math.pow(2, loginFailCount - 1), LOGIN_BACKOFF_MAX_MS);
       loginNextAllowedAt = Date.now() + delayMs;
@@ -324,6 +339,16 @@ async function ensureSession() {
 
 // セッション切れが疑われる場合に呼ぶ（再ログインを強制）
 async function reLogin() {
+  // 別の経路のログインが進行中なら、その結果を使う（同時に2回送らない・10分の間隔で弾かれないように）
+  if (loginInFlight) {
+    await loginInFlight;
+    return state.urls;
+  }
+  // state.urls を空にする前に送ってよいかを判定する。止める場合はまだ使えるかもしれない
+  // セッションを捨てずに残す（空にすると、送れない間ずっとセッション無しになるため）
+  var now = Date.now();
+  var blocked = accessGate.check(now) || accessGate.checkLogin(now);
+  if (blocked) throw accessGate.blockedError(blocked);
   state.urls = null;
   await login();
   return state.urls;
@@ -335,6 +360,8 @@ async function reLogin() {
 // セッションも 8:35 に取り直す必要があるため。
 // 再ログインした場合はtrueを返す（呼び出し側でWebSocket接続を張り直す必要がある）
 async function refreshIfNeeded() {
+  // 休場日は立花が閉まっているので取り直さない（翌営業日の8:35に取り直す）
+  if (accessGate.isClosedDay(Date.now())) return false;
   var reLoginTime = todayReLoginTimeMs();
   if (Date.now() < reLoginTime) return false; // まだ本日の再ログイン時刻より前
   if (state.loadedAt >= reLoginTime) return false; // 本日の再ログイン時刻以降に取得済み
@@ -350,4 +377,6 @@ module.exports = {
   postToServer: postToServer,
   checkAnswer: checkAnswer,
   nextHeader: nextHeader,
+  // 今のセッションを取得した時刻(epoch ms)。watcher が「接続を作った後に新しいセッションが取れたか」を見る
+  getLoadedAt: function () { return state.loadedAt; },
 };

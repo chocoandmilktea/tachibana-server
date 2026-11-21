@@ -8,6 +8,13 @@
 
 var WebSocket = require("ws");
 var EventEmitter = require("events");
+var accessGate = require("./accessGate");
+
+// 意図しない切断・接続できなかったときの再接続の待ち時間。
+// 失敗が続くたびに 3秒 → 6秒 → 12秒…と倍にし、最大5分。データを受け取れたら3秒に戻す。
+// 以前は3秒固定だったため、立花が閉まっている間も3秒おきに接続を試み続けていた
+var RECONNECT_BASE_MS = 3 * 1000;
+var RECONNECT_MAX_MS = 5 * 60 * 1000;
 
 class TachibanaEventClient extends EventEmitter {
   constructor(sUrlEventWebSocket, mktCode) {
@@ -17,6 +24,8 @@ class TachibanaEventClient extends EventEmitter {
     this.ws = null;
     this.currentTicker = null;
     this._closedByUs = false;
+    this._reconnectDelayMs = RECONNECT_BASE_MS; // 次に再接続するまでの待ち時間
+    this._reconnectTimer = null;
   }
 
   // 購読銘柄を切り替える（内部でいったん切断→再接続）
@@ -29,15 +38,49 @@ class TachibanaEventClient extends EventEmitter {
   stop() {
     this._closedByUs = true;
     this.currentTicker = null;
+    this._clearReconnect();
     if (this.ws) this.ws.close();
   }
 
+  // 今の接続を「意図しない切断」として切る。再接続は下の待ち時間（倍々）に従う。
+  // watcher がエラー応答を受けたときに、ログインせずに接続だけ切るために使う
+  dropConnection() {
+    if (this.ws) this.ws.close();
+  }
+
+  _clearReconnect() {
+    if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+  }
+
+  // 待ち時間をあけて再接続する。呼ぶたびに次の待ち時間を倍にする（最大5分）
+  _scheduleReconnect(ticker) {
+    var self = this;
+    var delay = this._reconnectDelayMs;
+    this._reconnectDelayMs = Math.min(delay * 2, RECONNECT_MAX_MS);
+    this._clearReconnect();
+    this._reconnectTimer = setTimeout(function () {
+      self._reconnectTimer = null;
+      if (self.currentTicker === ticker) self._connect(ticker);
+    }, delay);
+  }
+
   _connect(ticker) {
+    this._clearReconnect();
     if (this.ws) {
       this._closedByUs = true; // 古い接続のcloseイベントで再接続しないようにする
       this.ws.close();
+      this.ws = null;
     }
     this._closedByUs = false;
+
+    // 立花へ接続してよいか（休場日・3:00〜8:35・一時停止中は接続しない）。
+    // 止めた理由のログは accessGate が切り替わり時に1回だけ出すので、ここでは出さない。
+    // 送れるようになったら拾えるよう、待ち時間をあけて判定し直す
+    if (accessGate.check(Date.now())) {
+      this._scheduleReconnect(ticker);
+      return;
+    }
 
     var params = new URLSearchParams({
       p_rid: "21",
@@ -64,11 +107,11 @@ class TachibanaEventClient extends EventEmitter {
     });
 
     ws.on("close", function () {
+      // 張り直した後に古い接続のcloseが届いても、再接続を重ねて予約しない
+      if (self.ws !== ws) return;
       if (!self._closedByUs && self.currentTicker === ticker) {
-        // 意図しない切断。3秒後に再接続を試みる
-        setTimeout(function () {
-          if (self.currentTicker === ticker) self._connect(ticker);
-        }, 3000);
+        // 意図しない切断。待ち時間（3秒から倍々・最大5分）をあけて再接続を試みる
+        self._scheduleReconnect(ticker);
       }
     });
 
@@ -93,6 +136,8 @@ class TachibanaEventClient extends EventEmitter {
       return;
     }
 
+    // データを受け取れた＝接続は正常なので、再接続の待ち時間を3秒に戻す
+    this._reconnectDelayMs = RECONNECT_BASE_MS;
     this.emit("data", { ticker: ticker, fields: fields, raw: rawText });
   }
 }
