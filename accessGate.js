@@ -9,6 +9,7 @@
 //
 // 止めるのは次のとき（判定はすべて日本時間。Railwayの時計のタイムゾーンには頼らない）
 //   1. 休場日（土日・祝日・年末年始。holidays.js の isMarketClosed で判定）
+//   1b. 営業日で前日が休場日なら 0:00〜8:35（月曜・祝日明けの未明も閉局中のため）
 //   2. 営業日の 3:00〜8:35（立花のメンテナンス・サービス停止時間。8:35ちょうどからは送ってよい）
 //   3. 一時停止中（通信が3回続けて失敗したら5分間すべて止める）
 // ログインはさらに、前回の送信から10分たつまで送らない・1日5回まで、の上限を設ける。
@@ -51,13 +52,30 @@ function jstParts(nowMs) {
 }
 
 // 休場日判定は日付ごとに1回だけ holidays.js に聞く。
-// 判定は秒単位で何度も呼ばれるため、対応年外の警告ログが毎回出るのを防ぐ
-var closedCache = { date: null, closed: false };
+// 判定は秒単位で何度も呼ばれるため、対応年外の警告ログが毎回出るのを防ぐ。
+// 当日と前日を交互に聞くので、1日分ではなく数日分を覚えておく
+var closedCache = {};
+var closedCacheSize = 0;
 function isClosedDate(dateStr) {
-  if (closedCache.date !== dateStr) {
-    closedCache = { date: dateStr, closed: holidays.isMarketClosed(dateStr) };
+  if (!Object.prototype.hasOwnProperty.call(closedCache, dateStr)) {
+    if (closedCacheSize >= 10) { closedCache = {}; closedCacheSize = 0; }
+    closedCache[dateStr] = holidays.isMarketClosed(dateStr);
+    closedCacheSize += 1;
   }
-  return closedCache.closed;
+  return closedCache[dateStr];
+}
+
+// "YYYY-MM-DD" の前日
+function prevDateStr(dateStr) {
+  return new Date(Date.parse(dateStr + "T00:00:00Z") - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+// 営業日で、前日が休場日の場合は 0:00〜8:35 を止める（例：月曜・祝日明けの 0:00〜3:00）。
+// 3:00〜8:35 は別の条件でも止まるが、ここでは 0:00 から 8:35 までをまとめて判定する
+function judgeAfterHoliday(p) {
+  if (p.minutes >= MAINT_END_MIN) return null;
+  if (isClosedDate(p.date) || !isClosedDate(prevDateStr(p.date))) return null;
+  return { reason: "after-holiday", message: "休場日明けの営業日の0:00〜8:35のため立花へ送りません" };
 }
 
 function isClosedDay(nowMs) {
@@ -76,6 +94,8 @@ function judgeSend(nowMs) {
   if (isClosedDate(p.date)) {
     return { reason: "holiday", message: "休場日（" + p.date + "）のため立花へ送りません" };
   }
+  var afterHoliday = judgeAfterHoliday(p);
+  if (afterHoliday) return afterHoliday;
   if (p.minutes >= MAINT_START_MIN && p.minutes < MAINT_END_MIN) {
     return { reason: "maintenance", message: "営業日の3:00〜8:35（メンテナンス・サービス停止時間）のため立花へ送りません" };
   }
@@ -92,6 +112,9 @@ function judgeSend(nowMs) {
 function judgeLogin(nowMs) {
   var now = nowMs == null ? Date.now() : nowMs;
   var p = jstParts(now);
+  // 休場日明けの 0:00〜8:35 はログインも送らない（呼び出し側は judgeSend も必ず通すが、念のためここでも見る）
+  var afterHoliday = judgeAfterHoliday(p);
+  if (afterHoliday) return afterHoliday;
   var count = loginDate === p.date ? loginCount : 0;
   if (count >= LOGIN_DAILY_MAX) {
     return { reason: "login-daily-limit", message: "本日のログインが上限（" + LOGIN_DAILY_MAX + "回）に達したため送りません" };
@@ -194,7 +217,7 @@ function _resetForTest() {
 }
 
 // 起動時に設定を1行で出す（このファイルは auth.js から起動時に読み込まれる）
-log("設定: 休場日と営業日の3:00〜8:35は送信しない / ログインは10分以上あけて1日" + LOGIN_DAILY_MAX +
+log("設定: 休場日と営業日の3:00〜8:35（休場日明けは0:00〜8:35）は送信しない / ログインは10分以上あけて1日" + LOGIN_DAILY_MAX +
   "回まで / 通信が" + FAIL_LIMIT + "回続けて失敗したら5分間停止");
 
 module.exports = {

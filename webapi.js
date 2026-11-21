@@ -246,6 +246,16 @@ async function fetchBatchPrice(session, codes, columns) {
   return ans.aCLMMfdsMarketPrice || [];
 }
 
+// p_errno=0 で sResultCode だけがエラーの応答（銘柄コードの誤りなど）か。
+// fetchBatchPrice は checkAnswer で投げたエラーに立花の生の応答（e.answer）を付けている。
+// e.answer が無い＝通信の例外・タイムアウト・JSONとして読めない応答、
+// p_errno が0以外＝立花側の要求エラー（どちらも「通信の失敗」として扱う）
+function isResultCodeOnlyError(e) {
+  if (!e || e.blocked || !e.answer) return false;
+  var ans = e.answer;
+  return String(ans.p_errno) === "0" && ans.sResultCode != null && String(ans.sResultCode) !== "0";
+}
+
 async function getRankingData() {
   var now = Date.now();
   if (rankingDataCache.rows && now - rankingDataCache.ts < RANKING_DATA_TTL) return rankingDataCache.rows;
@@ -262,6 +272,7 @@ async function getRankingData() {
   var batches = chunk(codes, 120);
 
   var priceMap = {};
+  var skipped = 0; // sResultCode だけのエラーで飛ばした塊の数
   var concurrency = 5; // 検証済み：この並列数で全銘柄の取得が約4秒で完了する
   for (var j = 0; j < batches.length; j += concurrency) {
     var group = batches.slice(j, j + concurrency);
@@ -270,15 +281,22 @@ async function getRankingData() {
     results.forEach(function (r) {
       if (r.status === "fulfilled") {
         r.value.forEach(function (p) { priceMap[p.sIssueCode] = p; });
+      } else if (isResultCodeOnlyError(r.reason)) {
+        // 通信はできていて、その塊の中身だけがエラー（銘柄コードの誤りなど）。
+        // その塊は飛ばして残りの取得を続ける（PR #31 より前と同じ動き）
+        skipped += 1;
       } else {
         if (!r.reason.blocked) log("バッチ取得エラー:", r.reason.message);
         // 送信を止めた印付きのエラーを優先して返す（呼び出し元で503にするため）
         if (!failed || (r.reason.blocked && !failed.blocked)) failed = r.reason;
       }
     });
-    // どれか1つでも失敗したら残りの塊は送らずに打ち切る。立花の調子が悪いときに
+    // 送信を止めたとき・通信に失敗したときは残りの塊は送らずに打ち切る。立花の調子が悪いときに
     // 残り全部を送り続けないため。途中までの一覧は返さず、キャッシュにも保存しない
     if (failed) throw failed;
+  }
+  if (skipped > 0) {
+    log("sResultCode のエラーで飛ばした塊:", skipped + "個（全 " + batches.length + " 個中）。残りの塊で一覧を作ります");
   }
   // 全バッチが失敗・空だった場合は、空の一覧を成功扱いで返さない（キャッシュにも保存しない）。
   // Vercel側がRedisに残している前回の正常なデータを空で上書きさせないため
