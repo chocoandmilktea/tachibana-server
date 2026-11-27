@@ -14,6 +14,14 @@
 //   3. 一時停止中（通信が3回続けて失敗したら5分間すべて止める）
 // ログインはさらに、前回の送信から10分たつまで送らない・1日5回まで、の上限を設ける。
 //
+// 【休止中（TACHIBANA_SUSPENDED=true）】
+// 立花APIが止まっている間（2027年3月に再開予定）は、上の条件より先に、時刻にかかわらず
+// すべての送信とログインを止める。休止中はログインにHTMLが返り、毎営業日ログイン上限まで
+// 失敗し続けていたため。サーバー自体は止めない（scanner.js が Vercel へ定時スキャンを頼み続けるため）。
+// 値がちょうど "true" のときだけ休止とみなす。未設定や "true" 以外は休止前とまったく同じ動きにする。
+// 環境変数だが config.js を通さずここで直接読む（config.js は立花の接続設定の置き場で、
+// 休止の判定はこのファイルだけで完結させるため）。
+//
 // 判定する関数は現在時刻(epoch ms)を引数で受け取れる（省略時は Date.now()）。
 // 立花へ送らずに node から時刻を渡して確かめられるようにするため。
 
@@ -25,12 +33,15 @@ function log() {
 }
 
 // ── 設定（環境変数にはしない。README の環境変数一覧と食い違わせないため） ──
+// 例外は休止の切り替え TACHIBANA_SUSPENDED だけ（README の環境変数一覧への追記は別途必要）
 var MAINT_START_MIN = 3 * 60; // 3:00 から止める
 var MAINT_END_MIN = 8 * 60 + 35; // 8:35 ちょうどからは送ってよい
 var FAIL_LIMIT = 3; // この回数続けて失敗したら一時停止
 var PAUSE_MS = 5 * 60 * 1000; // 一時停止の長さ
 var LOGIN_MIN_INTERVAL_MS = 10 * 60 * 1000; // ログインを送ってから次を送れるまでの間隔
 var LOGIN_DAILY_MAX = 5; // 1日（日本時間の日付）あたりのログイン上限
+var SUSPENDED = process.env.TACHIBANA_SUSPENDED === "true"; // 立花API休止中なら true（起動時に1回だけ読む）
+var SUSPENDED_RESULT = { reason: "suspended", message: "立花API休止中（TACHIBANA_SUSPENDED）" };
 
 // ── 状態 ─────────────────────────────────────────────────────────────
 var failCount = 0; // 通信の連続失敗回数（成功で0に戻す）
@@ -41,6 +52,7 @@ var loginCount = 0; // その日に送ったログインの回数
 var lastLoginSentAt = 0; // 最後にログインを送った時刻(epoch ms)
 var lastSendBlockKey = null; // 直前の送信判定で止めた理由（ログを切り替わり時だけ出すため）
 var lastLoginBlockKey = null; // 直前のログイン判定で止めた理由
+var suspendedLogged = false; // 休止中で止めたことを既にログに出したか（起動してから1回だけ出す）
 
 // 日本時間の日付と、0時からの経過分を返す
 function jstParts(nowMs) {
@@ -89,6 +101,7 @@ function fmtTime(ms) {
 // ── 送信してよいかの判定（副作用なし） ─────────────────────────────────
 // 送ってよければ null、止めるなら { reason, message } を返す
 function judgeSend(nowMs) {
+  if (SUSPENDED) return SUSPENDED_RESULT; // 休止中は時刻にかかわらず止める
   var now = nowMs == null ? Date.now() : nowMs;
   var p = jstParts(now);
   if (isClosedDate(p.date)) {
@@ -110,6 +123,7 @@ function judgeSend(nowMs) {
 
 // ── ログインを送ってよいかの判定（副作用なし） ─────────────────────────
 function judgeLogin(nowMs) {
+  if (SUSPENDED) return SUSPENDED_RESULT; // 休止中は時刻にかかわらず止める
   var now = nowMs == null ? Date.now() : nowMs;
   var p = jstParts(now);
   // 休場日明けの 0:00〜8:35 はログインも送らない（呼び出し側は judgeSend も必ず通すが、念のためここでも見る）
@@ -130,9 +144,21 @@ function judgeLogin(nowMs) {
 }
 
 // ── 判定＋状態が切り替わったときだけログ ─────────────────────────────
-// 呼び出しのたびにログを出すと、3秒おきの監視ループや Vercel からの問い合わせで埋まるため
+// 呼び出しのたびにログを出すと、3秒おきの監視ループや Vercel からの問い合わせで埋まるため。
+// 休止中で止めたことは、送信・ログインのどちらの判定で止めたかにかかわらず起動してから1回だけ出す
+function logSuspendedOnce() {
+  if (suspendedLogged) return;
+  suspendedLogged = true;
+  log("送信を止めます:", SUSPENDED_RESULT.message + "。再開するまで立花へは一切送りません（このログは起動してから1回だけ出します）");
+}
+
 function check(nowMs) {
   var result = judgeSend(nowMs);
+  if (result === SUSPENDED_RESULT) {
+    logSuspendedOnce();
+    lastSendBlockKey = result.reason;
+    return result;
+  }
   var key = result ? result.reason : null;
   if (key !== lastSendBlockKey) {
     if (result) log("送信を止めます:", result.message);
@@ -144,6 +170,11 @@ function check(nowMs) {
 
 function checkLogin(nowMs) {
   var result = judgeLogin(nowMs);
+  if (result === SUSPENDED_RESULT) {
+    logSuspendedOnce();
+    lastLoginBlockKey = result.reason;
+    return result;
+  }
   var key = result ? result.reason : null;
   if (key !== lastLoginBlockKey) {
     if (result) log("ログインを止めます:", result.message);
@@ -218,7 +249,8 @@ function _resetForTest() {
 
 // 起動時に設定を1行で出す（このファイルは auth.js から起動時に読み込まれる）
 log("設定: 休場日と営業日の3:00〜8:35（休場日明けは0:00〜8:35）は送信しない / ログインは10分以上あけて1日" + LOGIN_DAILY_MAX +
-  "回まで / 通信が" + FAIL_LIMIT + "回続けて失敗したら5分間停止");
+  "回まで / 通信が" + FAIL_LIMIT + "回続けて失敗したら5分間停止 / 立花API休止中: " +
+  (SUSPENDED ? "はい（TACHIBANA_SUSPENDED=true。時刻にかかわらずすべての送信とログインを止める）" : "いいえ"));
 
 module.exports = {
   judgeSend: judgeSend,
